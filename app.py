@@ -133,7 +133,7 @@ def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status
                 msg = f"データ取得 試行 {attempt + 1}回目..."
                 _status_callback(msg)
             
-            df = fetch_availability_deep_scan(start_date, end_date, selected_facilities, _status_callback, _progress_bar, _debug_placeholder)
+            df = fetch_availability_deep_scan(start_date, end_date, selected_facilities, _status_callback, _progress_bar, _debug_placeholder, attempt_idx=attempt)
             if not df.empty:
                 return df
             
@@ -146,7 +146,7 @@ def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status
                 time.sleep(3)
     return pd.DataFrame()
 
-def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facilities=None, _status_callback=None, _progress_bar=None, _debug_placeholder=None):
+def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facilities=None, _status_callback=None, _progress_bar=None, _debug_placeholder=None, attempt_idx=0):
     driver = setup_driver()
     wait = WebDriverWait(driver, 30) 
     results = []
@@ -282,9 +282,28 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
              if _status_callback: _status_callback("⚠️ 検索結果の表示待機中にタイムアウトしました。")
              raise Exception("Room list not found (Timeout)")
 
-        # 5. Filter Results: BRUTE FORCE STRATEGY
-        if _status_callback: _status_callback(f"📍 対象施設を捜索中 (Brute Force Mode)...")
+        # 5. Filter Results: BRUTE FORCE STRATEGY with Accordion Expansion
+        if _status_callback: _status_callback(f"📍 対象施設を捜索中 (Accordion + Brute Force Mode)...")
         
+        # --- NEW: Step 2: Expand all Accordions
+        # Look for elements containing '室場一覧' and click them
+        if _status_callback: _status_callback(f"📂 「室場一覧」を展開中...")
+        acc_count = driver.execute_script("""
+            var count = 0;
+            var els = document.querySelectorAll('*');
+            for(var i=0; i<els.length; i++){
+                if(els[i].innerText && (els[i].innerText.includes('室場一覧') || els[i].innerText.includes('Room List')) && els[i].tagName !== 'SCRIPT'){
+                    try {
+                        els[i].click();
+                        count++;
+                    } catch(e) {}
+                }
+            }
+            return count;
+        """)
+        time.sleep(2) # Wait for animation
+        # --- End of Accordion Logic ---
+
         target_urls = []
         found_facilities_log = []
         
@@ -298,6 +317,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                 if not search_key: continue
                 
                 # XPath: Find text containing search_key, then find closest Check button
+                # Now that accordions are expanded, this should work.
                 xpath_brute = f"(//*[contains(text(), '{search_key}')]/following::*[contains(text(), '枠の確認') or contains(text(), '空き状況') or contains(text(), '予約')])[1]"
                 
                 try:
@@ -314,13 +334,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                              # It might be a button with onclick, try clicking
                              driver.execute_script("arguments[0].click();", button)
                              time.sleep(2)
-                             # If clicked, we assume navigation happened. 
-                             # We can't easily add to target_urls list if we navigate away.
-                             # But we need to support scraping multiple?
-                             # For now, let's assume we capture the link if possible, or just click.
                              pass
-                         
-                         # Note: If we just look for links, we are safer.
                 except:
                     continue
         
@@ -344,7 +358,9 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             if _debug_placeholder:
                 # DUMP HTML
                 html_source = driver.execute_script("return document.body.innerHTML;")
-                _debug_placeholder.text_area("Debug: HTML Context Dump", html_source[:5000], height=300)
+                # --- NEW: Step 3: Streamlit Fix (Unique Key)
+                unique_key = f"debug_html_dump_attempt_{attempt_idx}_{int(time.time()*1000)}"
+                _debug_placeholder.text_area("Debug: HTML Context Dump", html_source[:5000], height=300, key=unique_key)
             raise Exception("Brute force failed: No links found")
 
         # 6. Detail Loop (Calendar)
