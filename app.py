@@ -49,7 +49,7 @@ st.markdown("""
 TARGET_URL = "https://fujisawacity.service-now.com/facilities_reservation"
 MAX_RETRIES = 3
 
-# --- Scraper Logic (Embedded) ---
+# --- Scraper Logic (Deep Scan) ---
 def setup_driver():
     """Streamlit Cloud (Linux) 用のChrome Driver設定"""
     options = Options()
@@ -83,7 +83,7 @@ def attempt_scrape_with_retry(keyword, start_date, _status_callback, _progress_b
                 msg = f"データ取得 試行 {attempt + 1}回目..."
                 _status_callback(msg)
             
-            df = fetch_availability_core(keyword, start_date, _status_callback, _progress_bar)
+            df = fetch_availability_deep_scan(keyword, start_date, _status_callback, _progress_bar)
             if not df.empty:
                 return df
             
@@ -95,7 +95,7 @@ def attempt_scrape_with_retry(keyword, start_date, _status_callback, _progress_b
                 time.sleep(3)
     return pd.DataFrame()
 
-def fetch_availability_core(keyword="バレーボール", start_date=None, _status_callback=None, _progress_bar=None):
+def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, _status_callback=None, _progress_bar=None):
     driver = setup_driver()
     wait = WebDriverWait(driver, 30) 
     results = []
@@ -126,9 +126,10 @@ def fetch_availability_core(keyword="バレーボール", start_date=None, _stat
                 except: pass
 
         # 3. Purpose Search
-        if _status_callback: _status_callback(f"🏐 「{keyword}」を選択中...")
+        if _status_callback: _status_callback(f"🏐 「{keyword}」で施設を検索中...")
         search_done = False
         
+        # リンクがあればクリック (メニュー選択)
         try:
             links = driver.find_elements(By.PARTIAL_LINK_TEXT, keyword)
             for link in links:
@@ -139,6 +140,7 @@ def fetch_availability_core(keyword="バレーボール", start_date=None, _stat
                     break
         except: pass
 
+        # 検索ボタン入力
         if not search_done:
             try:
                 search_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索'], input[name*='keyword']")))
@@ -151,113 +153,131 @@ def fetch_availability_core(keyword="バレーボール", start_date=None, _stat
 
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-        # 4. Scan Facilities & Availability
-        if _status_callback: _status_callback("🔍 施設と空き情報を解析中...")
-
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        tables = soup.find_all("table")
+        # 4. Traverse Room List (Master-Detail)
+        if _status_callback: _status_callback("📋 室場リストを取得中...")
         
-        for tbl in tables:
-            txt = tbl.get_text()
-            if not ("空" in txt or "○" in txt or "×" in txt or "/" in txt):
-                continue
-
-            rows = tbl.find_all("tr")
-            if not rows: continue
-
-            headers = []
-            header_row = rows[0]
-            for th in header_row.find_all(["th", "td"]):
-                headers.append(th.get_text(strip=True))
-            
-            # Row scan
-            current_facility = "検索結果施設"
-            
-            for tr in rows[1:]:
-                cols = tr.find_all(["th", "td"])
-                if not cols: continue
-                
-                row_text = tr.get_text(separator="|", strip=True) 
-                
-                known_facilities = ["秋葉台", "秩父宮", "石名坂", "鵠沼", "北部", "太陽", "八部", "遠藤"]
-                for kf in known_facilities:
-                    if kf in row_text:
-                        current_facility = kf
-                        break
-
-                col0_text = cols[0].get_text(strip=True)
-                
-                for i, cell in enumerate(cols[1:]):
-                    status_text = cell.get_text(strip=True)
-                    status = "×"
-                    
-                    if "○" in status_text or "空" in status_text: status = "○"
-                    elif "△" in status_text: status = "△"
-                    elif "休" in status_text or "-" in status_text: continue
-                    else: continue
-                    
-                    if (i + 1) < len(headers):
-                        time_slot = headers[i + 1]
-                    else:
-                        time_slot = f"枠{i+1}"
-
-                    results.append({
-                        "日付": col0_text,
-                        "施設名": current_facility,
-                        "時間": time_slot,
-                        "状況": status
-                    })
+        # まずリストページにある「カレンダーアイコン」や「予約」ボタンのリンクを全収集
+        target_urls = []
         
-        # 5. Deep Scan fallback
-        if not results:
-            if _status_callback: _status_callback("📄 詳細ページを巡回中...")
-            links = driver.find_elements(By.TAG_NAME, "a")
-            target_urls = []
-            for a in links:
-                try:
-                    href = a.get_attribute("href")
-                    txt = a.text
-                    if href and ("calendar" in href or "reference" in href):
-                        target_urls.append((txt, href))
-                except: pass
+        # テーブル行をスキャンして、施設名/室場名とURLのペアを取得
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, "tr")
+            current_facility_context = "詳細不明"
             
-            target_urls = list(set(target_urls))
+            for row in rows:
+                text = row.text
+                
+                # 施設名行の検知（ヘッダー等はスキップが必要だが、とりあえずヒューリスティックに）
+                if "体育館" in text or "センター" in text or "公園" in text:
+                    # ここが施設ヘッダーかもしれない
+                    # 通常は、行の中に施設名テキストがある
+                    pass 
+                
+                # リンク（ボタン）を探す
+                links = row.find_elements(By.TAG_NAME, "a")
+                for link in links:
+                    href = link.get_attribute("href")
+                    # カレンダー遷移っぽいURL
+                    if href and ("calendar" in href or "reserve" in href or "detail" in href):
+                        row_raw_text = row.text.replace("\n", " ")
+                        target_urls.append({
+                            "url": href,
+                            "raw_text": row_raw_text # これを後でパースして施設名/室場名にする
+                        })
+        except: pass
+        
+        # 重複排除 (URLベース)
+        unique_targets = {}
+        for t in target_urls:
+            unique_targets[t['url']] = t
+        target_list = list(unique_targets.values())
+
+        if not target_list:
+            # フォールバック：ページ内の全リンクからカレンダーっぽいものを探す
+             all_links = driver.find_elements(By.TAG_NAME, "a")
+             for a in all_links:
+                 try:
+                     href = a.get_attribute("href")
+                     if href and ("calendar" in href):
+                         target_list.append({"url": href, "raw_text": a.text})
+                 except: pass
+
+        # 5. Loop through Detail Pages
+        total_targets = len(target_list)
+        if _status_callback: _status_callback(f"🔍 {total_targets} 件の室場カレンダーを巡回解析します...")
+
+        for idx, target in enumerate(target_list):
+            url = target['url']
+            raw_text = target['raw_text']
             
-            for idx, (t_txt, t_url) in enumerate(target_urls):
-                if _progress_bar: _progress_bar.progress(idx / max(len(target_urls), 1))
-                driver.get(t_url)
-                time.sleep(2)
+            if _progress_bar: _progress_bar.progress(idx / max(total_targets, 1))
+            
+            # Extract names from raw text if possible
+            # e.g. "秋葉台文化体育館 第1体育室 予約と空き状況"
+            facility_name = "不明"
+            room_name = "不明"
+            
+            known_facilities = ["秋葉台", "秩父宮", "石名坂", "鵠沼", "北部", "太陽", "八部", "遠藤"]
+            for kf in known_facilities:
+                if kf in raw_text:
+                    facility_name = kf
+                    # 室場名の推定: 施設名を除去した残りの部分
+                    room_name = raw_text.replace(kf, "").replace("文化体育館", "").replace("市民センター", "").replace("体育室", "").strip()
+                    if not room_name: room_name = "体育室" # default
+                    break
+            
+            if _status_callback: _status_callback(f"解析中: {facility_name} {room_name}")
+
+            # Navigate
+            driver.get(url)
+            time.sleep(2)
+            
+            # Scrape Calendar Table
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            calendar_tables = soup.find_all("table")
+            
+            for tbl in calendar_tables:
+                # 必須要素の確認
+                txt_content = tbl.get_text()
+                if not ("空" in txt_content or "○" in txt_content or "×" in txt_content):
+                    continue
                 
-                soup_sub = BeautifulSoup(driver.page_source, "html.parser")
-                sub_tables = soup_sub.find_all("table")
+                rows = tbl.find_all("tr")
+                if not rows: continue
                 
-                facility_name_sub = t_txt
+                # Header Parse
+                headers = []
                 try:
-                    h_elem = driver.find_element(By.CSS_SELECTOR, "h1, h2, .facility-name")
-                    facility_name_sub = h_elem.text
-                except: pass
+                    for th in rows[0].find_all(["th", "td"]):
+                        headers.append(th.get_text(strip=True))
+                except: continue
                 
-                for stbl in sub_tables:
-                     srows = stbl.find_all("tr")
-                     if not srows: continue
-                     sheaders = [th.get_text(strip=True) for th in srows[0].find_all(["th", "td"])]
-                     for str_row in srows[1:]:
-                         scols = str_row.find_all(["th", "td"])
-                         if not scols: continue
-                         date_val = scols[0].get_text(strip=True)
-                         for si, scell in enumerate(scols[1:]):
-                             sstat_txt = scell.get_text(strip=True)
-                             sstat = "×"
-                             if "○" in sstat_txt or "空" in sstat_txt: sstat = "○"
-                             elif "△" in sstat_txt: sstat = "△"
-                             else: continue
-                             stime = sheaders[si+1] if (si+1) < len(sheaders) else ""
-                             results.append({
-                                 "日付": date_val,
-                                 "施設名": facility_name_sub,
-                                 "時間": stime,
-                                 "状況": sstat
-                             })
+                # Data Parse
+                for tr in rows[1:]:
+                    cols = tr.find_all(["th", "td"])
+                    if not cols: continue
+                    
+                    # Date (Column 0 usually)
+                    date_val = cols[0].get_text(strip=True)
+                    
+                    # Time Slots
+                    for i, td in enumerate(cols[1:]):
+                        stat_text = td.get_text(strip=True)
+                        status = "×"
+                        if "○" in stat_text or "空" in stat_text: status = "○"
+                        elif "△" in stat_text: status = "△"
+                        else: continue
+                        
+                        # Time header
+                        t_slot = headers[i+1] if (i+1) < len(headers) else ""
+                        
+                        results.append({
+                            "日付": date_val,
+                            "施設名": facility_name,
+                            "室場名": room_name,
+                            "時間": t_slot,
+                            "状況": status
+                        })
 
     except Exception as e:
         logger.error(f"Scrape Error: {e}")
@@ -265,7 +285,7 @@ def fetch_availability_core(keyword="バレーボール", start_date=None, _stat
         driver.quit()
 
     if not results:
-        return pd.DataFrame(columns=['日付', '施設名', '時間', '状況', '曜日', 'dt'])
+        return pd.DataFrame(columns=['日付', '施設名', '室場名', '時間', '状況', '曜日', 'dt'])
     
     return pd.DataFrame(results)
 
@@ -280,32 +300,26 @@ def enrich_data(df):
     def parse_date(d_str):
         if not isinstance(d_str, str): return None
         try:
-            # Common formats: "2026-03-01", "3/1(土)", "03/01", "2026/3/1"
             clean = d_str.split('(')[0].strip()
-            # Normalize separators
             clean = clean.replace('年', '/').replace('月', '/').replace('日', '').replace('-', '/').replace('.', '/')
-            parts = [p for p in clean.split('/') if p.strip()] # remove empty
+            parts = [p for p in clean.split('/') if p.strip()]
             
             y, m, d = None, None, None
             
             if len(parts) == 3:
-                # YYYY/MM/DD or MM/DD/YYYY
                 if len(parts[0]) == 4:
                     y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
                 elif len(parts[2]) == 4:
                     y, m, d = int(parts[2]), int(parts[0]), int(parts[1])
             elif len(parts) == 2:
-                # MM/DD
                 m, d = int(parts[0]), int(parts[1])
                 y = CURRENT_YEAR
-                # If date is very old (e.g. searching for Jan in Dec), assume next year
                 temp_dt = datetime.date(y, m, d)
                 if temp_dt < TODAY - datetime.timedelta(days=90):
                     y += 1
             
             if y and m and d:
                 return datetime.date(y, m, d)
-                
         except: return None
         return None
 
@@ -320,13 +334,12 @@ def enrich_data(df):
             if jpholiday.is_holiday(dt): return "祝"
             return ["月","火","水","木","金","土","日"][dt.weekday()]
             
-        # 2. Try from string (e.g. "3/1(土)")
-        # Look for (土) or （土）
+        # 2. Try from string
         for w in ["月","火","水","木","金","土","日"]:
             if f"({w})" in d_str or f"（{w}）" in d_str:
                 return w
                 
-        return "不明"
+        return "詳細不明"
 
     df['曜日'] = df.apply(get_day, axis=1)
     return df
@@ -338,9 +351,10 @@ def get_data(keyword, start_date, _status, _progress):
 
 def render_schedule_card(row):
     status = row['状況']
-    facility = row['施設名']
-    date_str = row['日付']
-    time_slot = row['時間']
+    facility = row.get('施設名', '不明')
+    room = row.get('室場名', '')
+    date_str = row.get('日付', '')
+    time_slot = row.get('時間', '')
     day_label = row.get('曜日', '不明')
     
     badge_color = "gray"
@@ -364,7 +378,7 @@ def render_schedule_card(row):
             st.metric(label="状況", value=status, delta=status_label, delta_color=delta_color)
         with col2:
             st.markdown(f"**{date_str}** :{badge_color}[{day_label}]")
-            st.text(f"{facility}")
+            st.text(f"{facility} {room}")
             st.caption(f"{time_slot}")
 
 def main():
@@ -406,12 +420,8 @@ def main():
                 # Time Filter
                 mask = pd.Series(True, index=df.index)
                 
-                # Check valid dates
                 if 'dt' in df.columns:
-                     # Keep rows even if dt is None? Maybe yes to debug
-                     # But for date range filter we need dt
                      date_mask = (df['dt'] >= start_d) & (df['dt'] <= end_d)
-                     # Handle NaT/None
                      date_mask = date_mask.fillna(False)
                      mask &= date_mask
 
@@ -431,7 +441,7 @@ def main():
                     except: pass
 
                     with st.expander("全体の表を見る"):
-                        st.table(final_df[['日付', '曜日', '施設名', '時間', '状況']])
+                        st.table(final_df[['日付', '曜日', '施設名', '室場名', '時間', '状況']])
                     
                     st.subheader("空き状況カード")
                     for _, row in final_df.iterrows():
