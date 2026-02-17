@@ -309,7 +309,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
 
         # Wait for Results
         try:
-            if _status_callback: _status_callback("⏳ 検索結果リスト待機中...")
+            if _status_callback: _status_callback("⏳ 検索結果リス待待機中...")
             wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '市民センター')]")))
         except:
             if _status_callback: _status_callback("⚠️ コンテキストロストの可能性。結果フレームを再探索します...")
@@ -320,7 +320,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索結果表示", use_column_width=True)
 
         # ------------------------------------------------------------------
-        # MAIN LOOP: Navigate -> Click -> Scrape -> Back
+        # MAIN LOOP: Navigate -> Click -> Scrape -> Back (FRESH RE-ACQUISITION)
         # ------------------------------------------------------------------
         if selected_facilities:
              total_targets = len(selected_facilities)
@@ -334,37 +334,38 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                  found_context = switch_to_target_frame(driver, "市民センター", None)
                  
                  # 1. Expand Accordions (Must be done every time we return to list)
-                 driver.execute_script("""
-                     var els = document.querySelectorAll('*');
-                     for(var i=0; i<els.length; i++){
-                         if(els[i].innerText && (els[i].innerText.includes('室場一覧') || els[i].innerText.includes('Room List')) && els[i].tagName !== 'SCRIPT'){
-                             try { els[i].click(); } catch(e) {}
-                         }
-                     }
-                 """)
-                 time.sleep(1.5)
-
-                 # 2. Find Scope & Click
+                 # But first, we need to find the specific facility.
+                 
                  search_key = fac[:2]
                  if not search_key: continue
                  
                  is_click_success = False
                  
                  try:
-                     # Find Header
+                     # Find Header FRESHLY
                      xpath_header = f"//*[contains(text(), '{search_key}')]"
                      candidates = driver.find_elements(By.XPATH, xpath_header)
                      
+                     if not candidates:
+                         logger.warning(f"Header for {fac} not found.")
+                         continue
+
                      for cand in candidates:
                          if not cand.is_displayed(): continue
                          
                          try:
+                             # SCOPED LOGIC
+                             if _status_callback: _status_callback(f"🔎 {fac} のアコーディオンを探索中...")
+                             
                              # Find toggle relative to header
                              room_list_toggle = cand.find_element(By.XPATH, "./following::*[contains(text(), '室場一覧') or contains(text(), 'Room List')][1]")
                              
-                             # Expand again just in case (JS above might have missed dynamic ones)
-                             # driver.execute_script("arguments[0].click();", room_list_toggle)
-                             
+                             # EXPAND IT
+                             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", room_list_toggle)
+                             time.sleep(0.5)
+                             driver.execute_script("arguments[0].click();", room_list_toggle)
+                             time.sleep(1.0) # Wait for expansion
+
                              # Find Gym relative to toggle
                              gym_row = room_list_toggle.find_element(By.XPATH, "./following::*[contains(text(), '体育室')][1]")
                              
@@ -390,7 +391,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                              continue
                      
                      if not is_click_success:
-                         # Fallback: Just look for any gym button? No, that ruins multi-facility accuracy.
                          logger.warning(f"Could not find button for {fac}")
                          continue
 
