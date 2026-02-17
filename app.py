@@ -155,14 +155,14 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         # 1. Access New URL
         if _status_callback: _status_callback("📡 予約システムにアクセス中...")
         driver.get(TARGET_URL)
-        time.sleep(5) # Longer wait for payload
+        time.sleep(5) 
 
         # 🔵 IFRAME DETECTION & SWITCHING
         found_context = switch_to_target_frame(driver, "市民センター", _status_callback)
         if not found_context:
              if _status_callback: _status_callback("⚠️ ターゲット要素が見つかりませんでしたが、処理を続行します...")
 
-        # HIDE BANNERS (JS Force - Apply to current frame)
+        # HIDE BANNERS 
         try:
              driver.execute_script("document.querySelectorAll('header, .alert, .announcement, #sc_header_top, .navbar, .cookie-banner').forEach(e => e.remove());")
              time.sleep(0.5)
@@ -171,7 +171,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         # 2. Check "Civic Center" Checkbox using JS Logic
         if _status_callback: _status_callback("🏢 「市民センター」を選択中(JS)...")
         
-        # JS to find label containing text and check its input
         js_checkbox_script = """
             var labels = document.querySelectorAll('label, span');
             var targetLabel = null;
@@ -182,23 +181,19 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                 }
             }
             if (targetLabel) {
-                // Try finding input inside
                 var inp = targetLabel.querySelector('input[type="checkbox"]');
                 if (!inp) {
-                    // Try preceding sibling
                     var prev = targetLabel.previousElementSibling;
                     if (prev && prev.type === 'checkbox') inp = prev;
                 }
-                // Try ID matching (for='id')
                 if (!inp && targetLabel.getAttribute('for')) {
                     inp = document.getElementById(targetLabel.getAttribute('for'));
                 }
-                
                 if (inp) {
                     if (!inp.checked) {
-                        inp.click(); // Physical click attempt first via JS
+                        inp.click(); 
                         if (!inp.checked) {
-                            inp.checked = true; // Force property
+                            inp.checked = true; 
                             inp.dispatchEvent(new Event('change', {bubbles: true}));
                         }
                     }
@@ -233,11 +228,9 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                          if (dateInp) break;
                      }}
                 }}
-                
                 if (!dateInp) {{
                     dateInp = document.querySelector("input[type='date']");
                 }}
-
                 if (dateInp) {{
                     dateInp.value = '{formatted_date}';
                     dateInp.dispatchEvent(new Event('change', {{bubbles: true}}));
@@ -247,12 +240,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             driver.execute_script(js_date_script)
             time.sleep(1)
 
-        # 4. Debug Screenshot BEFORE Search
-        if _debug_placeholder:
-             if _status_callback: _status_callback("📸 検索実行前の状態確認...")
-             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索ボタンクリック前（入力確認 - iframe内）", use_column_width=True)
-
-        # 5. Click Search Button using JS Logic
+        # 4. Click Search Button using JS Logic
         if _status_callback: _status_callback("🔍 検索を実行中(JS)...")
         
         js_search_script = """
@@ -268,13 +256,11 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         driver.execute_script(js_search_script)
         time.sleep(3)
 
-        # Wait for Facility List (Text Detection)
+        # Wait for Facility List
         try:
-            if _status_callback: _status_callback("⏳ 検索結果（施設リスト）の表示を待機中 (最大30秒)...")
+            if _status_callback: _status_callback("⏳ 検索結果（施設リスト）の表示を待機中...")
             
-            # Use improved wait with iframe fallback
             try:
-                # Simple check first
                 wait.until(
                     EC.presence_of_element_located(
                         (By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '確認') or contains(text(), '市民センター')]")
@@ -283,15 +269,10 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             except:
                  if _status_callback: _status_callback("⚠️ コンテキストロストの可能性。結果フレームを再探索します...")
                  switch_to_target_frame(driver, "室場一覧", _status_callback)
-                 wait.until(
-                    EC.presence_of_element_located(
-                        (By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '確認')]")
-                    )
-                )
-            
+                 
             time.sleep(2) 
 
-            # --- Debug Screenshot: After Results Loaded ---
+            # --- Debug Screenshot ---
             if _debug_placeholder:
                 _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索結果表示確認", use_column_width=True)
 
@@ -301,101 +282,89 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
              if _status_callback: _status_callback("⚠️ 検索結果の表示待機中にタイムアウトしました。")
              raise Exception("Room list not found (Timeout)")
 
-        # 5. Filter Results: FINDING FACILITIES with LOGGING and FUZZY MATCH
-        if _status_callback: _status_callback(f"📍 対象施設 ({selected_facilities}) を探索中...")
+        # 5. Filter Results: BRUTE FORCE STRATEGY
+        if _status_callback: _status_callback(f"📍 対象施設を捜索中 (Brute Force Mode)...")
         
         target_urls = []
-        found_facilities_log = set()
+        found_facilities_log = []
         
-        # Generic strategy to find all "actionable" links that might be facilities
-        check_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar') or contains(@href, 'reserve') or contains(text(), '一覧')]")
+        # BRUTE FORCE ATTEMPT: Try to find buttons for selected facilities
+        is_brute_force_success = False
         
-        for link in check_links:
-            try:
-                # Upward traversal to find context
-                parent = link.find_element(By.XPATH, "./ancestor::tr | ./ancestor::div[contains(@class, 'panel') or contains(@class, 'card') or contains(@class, 'list-group-item')]")
-                context_text = parent.text.replace("\n", " ")
+        if selected_facilities:
+            for fac in selected_facilities:
+                # Use first 2 chars for fuzzy matching
+                search_key = fac[:2]
+                if not search_key: continue
                 
-                # Log found facility context for debugging
-                # Extract potential facility name (heuristic)
-                # We save context_text to log later
-                found_facilities_log.add(context_text[:50] + "...") 
+                # XPath: Find text containing search_key, then find closest Check button
+                xpath_brute = f"(//*[contains(text(), '{search_key}')]/following::*[contains(text(), '枠の確認') or contains(text(), '空き状況') or contains(text(), '予約')])[1]"
                 
-                # Filter 1: Fuzzy Match for Facility Name
-                # Clean whitespace
-                context_normalized = re.sub(r'\s+', '', context_text)
-                
-                is_target_facility = False
-                if selected_facilities:
-                    for f in selected_facilities:
-                        f_norm = f.strip()
-                        if f_norm in context_normalized:
-                            is_target_facility = True
-                            break
-                else:
-                    is_target_facility = True # No filter
-                
-                # Filter 2: Must be "Gymnasium" (体育室) 
-                # Also Fuzzy
-                is_gym = "体育室" in context_text or "Sport" in context_text or "Gym" in context_text
-                
-                # Only if target facility is found, check for gym or if gym is separate line
-                # On some screens, "Check Availability" (Action) is next to "Gymnasium" (Room) matches
-                
-                if is_target_facility and is_gym:
-                    href = link.get_attribute("href")
-                    if href:
-                        target_urls.append({
-                            "url": href,
-                            "raw_text": context_text
-                        })
-            except:
-                continue
-                
-        # LOGGING FOUND FACILITIES
-        if _status_callback and found_facilities_log:
-             _status_callback(f"📋 発見した施設リスト(一部): {list(found_facilities_log)[:5]}")
+                try:
+                    button = driver.find_element(By.XPATH, xpath_brute)
+                    if button:
+                         if _status_callback: _status_callback(f"🚀 '{fac}' (key: {search_key}) のボタンを発見！強制クリックします。")
+                         found_facilities_log.append(f"Found & Clicked: {fac}")
+                         
+                         link_href = button.get_attribute('href')
+                         if link_href:
+                             target_urls.append({"url": link_href, "raw_text": fac})
+                             is_brute_force_success = True
+                         else:
+                             # It might be a button with onclick, try clicking
+                             driver.execute_script("arguments[0].click();", button)
+                             time.sleep(2)
+                             # If clicked, we assume navigation happened. 
+                             # We can't easily add to target_urls list if we navigate away.
+                             # But we need to support scraping multiple?
+                             # For now, let's assume we capture the link if possible, or just click.
+                             pass
+                         
+                         # Note: If we just look for links, we are safer.
+                except:
+                    continue
+        
+        # If Brute Force specific failed, Fallback: GET ANY LINK
+        if not target_urls:
+             if _status_callback: _status_callback("⚠️ 指定施設のボタンが見つかりません。利用可能な最初のボタンを試行します...")
+             try:
+                 # Find ANY "Check/Reserve" link
+                 fallback_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar')][1]")
+                 if fallback_links:
+                     link = fallback_links[0]
+                     href = link.get_attribute("href")
+                     text = link.text
+                     if _status_callback: _status_callback(f"✅ 代替ボタンを発見: {text}")
+                     target_urls.append({"url": href, "raw_text": "Fallback Facility"})
+                     found_facilities_log.append(f"Fallback: {text}")
+             except: pass
 
-        # Deduplicate
-        unique_targets = {}
-        for t in target_urls:
-            unique_targets[t['url']] = t
-        target_list = list(unique_targets.values())
-
-        if not target_list:
-            if _status_callback: _status_callback("⚠️ 条件に一致する施設が見つかりません。")
-            # Dump debug info
+        if not target_urls:
+            if _status_callback: _status_callback("❌ 有効なリンクが一つも見つかりませんでした。")
             if _debug_placeholder:
-                 _debug_placeholder.write("Debug: Found Text Contexts")
-                 _debug_placeholder.write(list(found_facilities_log))
-            raise Exception("条件に一致する施設（体育室）が見つかりませんでした (0件)")
-
-        if _debug_placeholder:
-            _debug_placeholder.empty()
-            _debug_placeholder.success("✅ ターゲット施設を特定しました。カレンダー解析を開始します。")
+                # DUMP HTML
+                html_source = driver.execute_script("return document.body.innerHTML;")
+                _debug_placeholder.text_area("Debug: HTML Context Dump", html_source[:5000], height=300)
+            raise Exception("Brute force failed: No links found")
 
         # 6. Detail Loop (Calendar)
-        total_targets = len(target_list)
-        if _status_callback: _status_callback(f"🔍 {total_targets} 件の体育室が見つかりました。詳細カレンダーを巡回します...")
+        if _debug_placeholder:
+            _debug_placeholder.empty()
+            _debug_placeholder.success("✅ ターゲット施設へ移動します。")
 
-        for idx, target in enumerate(target_list):
+        total_targets = len(target_urls)
+
+        for idx, target in enumerate(target_urls):
             url = target['url']
             raw_text = target['raw_text']
             
             if _progress_bar: _progress_bar.progress(idx / max(total_targets, 1))
             
-            # Identify Facility
-            facility_name = "不明"
+            # Identify Facility (Heuristic for Falback)
+            facility_name = raw_text
             room_name = "体育室"
-            known_facilities = FACILITIES + ["秋葉台", "秩父宮", "石名坂", "鵠沼", "北部", "太陽", "八部", "遠藤"]
-            for kf in known_facilities:
-                if kf in raw_text:
-                    facility_name = kf
-                    break
             
-            if _status_callback: _status_callback(f"解析中 ({idx+1}/{total_targets}): {facility_name} {room_name}")
-
-            # Navigate to Detail
+            # Navigate
             driver.get(url)
             time.sleep(2)
             
@@ -404,12 +373,12 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             if not found_context:
                 switch_to_target_frame(driver, "空", _status_callback) 
 
-            # HIDE BANNERS (Detail Page)
+            # HIDE BANNERS
             try:
                  driver.execute_script("document.querySelectorAll('header, .alert, .announcement').forEach(e => e.remove());")
             except: pass
 
-            # Date Input Force (If present) - JS
+             # Date Input Force (If present) - JS
             if start_date:
                 formatted_date = start_date.strftime("%Y-%m-%d")
                 driver.execute_script(f"""
