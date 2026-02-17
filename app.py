@@ -90,8 +90,9 @@ def attempt_scrape_with_retry(keyword, start_date, end_date, selected_facilities
             if not df.empty:
                 return df
             
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(3)
+            # If empty, treating as failure to trigger retry in this aggressive logic
+            raise Exception("空き情報が見つかりませんでした (0件)")
+            
         except Exception as e:
             logger.error(f"Attempt {attempt+1} failed: {e}")
             if attempt < MAX_RETRIES - 1:
@@ -149,19 +150,17 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                     search_done = True
                     break
 
-            # Step C: Click Search Button (Explicit Wait & Click)
+            # Step C: Click Search Button (Explicit JS Click)
             if search_done:
                 search_btns = driver.find_elements(By.XPATH, "//button[contains(text(), '検索')] | //input[@type='button' and @value='検索'] | //a[contains(text(), '検索') and contains(@class, 'btn')]")
                 btn_clicked = False
                 for btn in search_btns:
                     if btn.is_displayed():
-                        safe_click_js(driver, btn)
+                        # Force JS Click
+                        driver.execute_script("arguments[0].click();", btn)
                         btn_clicked = True
                         time.sleep(2) 
                         break
-                if not btn_clicked:
-                    # Retry searching for generic button
-                    pass
         except Exception as e:
             logger.warning(f"Category search error: {e}")
 
@@ -175,35 +174,38 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                 time.sleep(3)
             except: pass
 
-        # Wait for Room List (Table) - Increased Wait
+        # Wait for Room List (Table) - Strict 30s Wait
         try:
-            if _status_callback: _status_callback("⏳ 室場リストの表示を待機中...")
+            if _status_callback: _status_callback("⏳ 室場リストの表示を待機中 (最大30秒)...")
             wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "tr")))
         except:
-             if _status_callback: _status_callback("⚠️ 室場リストが見つかりませんでした。条件を変えて再試行してください。")
+             if _status_callback: _status_callback("⚠️ 室場リストが見つかりませんでした。リトライします。")
+             raise Exception("Room list not found")
 
-        # 4. Traverse Room List (Collect URLs & Filter by Facility)
+        # 4. Traverse Room List (Collect URLs & Strict Facility Filter)
         target_urls = []
         try:
             rows = driver.find_elements(By.CSS_SELECTOR, "tr")
             for row in rows:
-                links = row.find_elements(By.TAG_NAME, "a")
-                for link in links:
-                    href = link.get_attribute("href")
-                    if href and ("calendar" in href or "reserve" in href or "detail" in href):
-                        row_raw_text = row.text.replace("\n", " ")
-                        
-                        # Facility Filtering Logic
-                        is_target = False
-                        if not selected_facilities: 
+                row_raw_text = row.text.replace("\n", " ")
+                
+                # Check Facility Name *Before* finding link
+                is_target = False
+                if not selected_facilities: 
+                    is_target = True
+                else:
+                    for f in selected_facilities:
+                        if f in row_raw_text:
                             is_target = True
-                        else:
-                            for f in selected_facilities:
-                                if f in row_raw_text:
-                                    is_target = True
-                                    break
-                        
-                        if is_target:
+                            break
+                
+                if is_target:
+                    links = row.find_elements(By.TAG_NAME, "a")
+                    for link in links:
+                        href = link.get_attribute("href")
+                        # Click "Check Availability/Reserve" (空き状況確認・予約)
+                        # We use URL heuristics primarily as button text varies
+                        if href and ("calendar" in href or "reserve" in href or "detail" in href):
                             target_urls.append({
                                 "url": href,
                                 "raw_text": row_raw_text
@@ -215,6 +217,9 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
         for t in target_urls:
             unique_targets[t['url']] = t
         target_list = list(unique_targets.values())
+
+        if not target_list:
+            raise Exception("条件に一致する施設が見つかりませんでした (0件)")
 
         # 5. Detail Loop with "Next Month" Support
         total_targets = len(target_list)
@@ -243,29 +248,11 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
             driver.get(url)
             time.sleep(1)
             
-            # --- Calendar Navigation Loop (Smart Navigation) ---
-            # Iterate through months until we cover end_date
-            
-            # Cap at 5 months max to be safe
+            # --- Calendar Navigation Loop ---
             for _ in range(5): 
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 calendar_tables = soup.find_all("table")
                 
-                # Check displayed dates in table
-                table_dates = []
-                for tbl in calendar_tables:
-                    rows = tbl.find_all("tr")
-                    for tr in rows[1:]: # Skip header
-                         cols = tr.find_all(["th", "td"])
-                         if cols:
-                             d_txt = cols[0].get_text(strip=True)
-                             # Simple heuristic to guess date
-                             # Ideally we parse, but for navigation "is relevant" check:
-                             # We just assume current page is relevant if we are here.
-                             # But we need to know if we should click Next.
-                             pass
-
-                # Parse Table
                 parsed_something = False
                 for tbl in calendar_tables:
                     txt_content = tbl.get_text()
@@ -305,14 +292,6 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                             })
                     parsed_something = True
 
-                # Decision to Click Next
-                # If we parsed something, check if the latest date is >= end_date
-                # For now, simple logic: execute Next 3 times fixed, or check user input.
-                # User wants "Scan until specified month".
-                # If end_date is far in future, we need more clicks.
-                # Let's trust the "range(5)" with a break condition if we exceed end_date?
-                # Without robust parsed date checking, just range(3) is safer for now.
-                # Updating to 3 based on typical use case (3 months view).
                 if _ >= 3: 
                     break
 
@@ -332,6 +311,8 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
 
     except Exception as e:
         logger.error(f"Scrape Error: {e}")
+        # Re-raise to trigger top-level retry
+        raise e
     finally:
         driver.quit()
 
