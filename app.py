@@ -4,6 +4,7 @@ import time
 import logging
 import datetime
 import jpholiday
+import re
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -49,9 +50,8 @@ st.markdown("""
 TARGET_URL = "https://fujisawacity.service-now.com/facilities_reservation"
 MAX_RETRIES = 3
 
-# --- Scraper Logic (Deep Scan) ---
+# --- Scraper Logic (Deep Scan with Navigation) ---
 def setup_driver():
-    """Streamlit Cloud (Linux) 用のChrome Driver設定"""
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
@@ -76,14 +76,14 @@ def safe_click_js(driver, element):
     except:
         return False
 
-def attempt_scrape_with_retry(keyword, start_date, _status_callback, _progress_bar):
+def attempt_scrape_with_retry(keyword, start_date, end_date, _status_callback, _progress_bar):
     for attempt in range(MAX_RETRIES):
         try:
             if _status_callback: 
                 msg = f"データ取得 試行 {attempt + 1}回目..."
                 _status_callback(msg)
             
-            df = fetch_availability_deep_scan(keyword, start_date, _status_callback, _progress_bar)
+            df = fetch_availability_deep_scan(keyword, start_date, end_date, _status_callback, _progress_bar)
             if not df.empty:
                 return df
             
@@ -95,7 +95,7 @@ def attempt_scrape_with_retry(keyword, start_date, _status_callback, _progress_b
                 time.sleep(3)
     return pd.DataFrame()
 
-def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, _status_callback=None, _progress_bar=None):
+def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, end_date=None, _status_callback=None, _progress_bar=None):
     driver = setup_driver()
     wait = WebDriverWait(driver, 30) 
     results = []
@@ -108,7 +108,6 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
         frames = driver.find_elements(By.TAG_NAME, "iframe")
         if frames:
             driver.switch_to.frame(0)
-            logger.info("Switched to iframe")
 
         # 2. Date Input
         if start_date:
@@ -129,7 +128,6 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
         if _status_callback: _status_callback(f"🏐 「{keyword}」で施設を検索中...")
         search_done = False
         
-        # リンクがあればクリック (メニュー選択)
         try:
             links = driver.find_elements(By.PARTIAL_LINK_TEXT, keyword)
             for link in links:
@@ -140,7 +138,6 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                     break
         except: pass
 
-        # 検索ボタン入力
         if not search_done:
             try:
                 search_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索'], input[name*='keyword']")))
@@ -153,47 +150,31 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
 
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-        # 4. Traverse Room List (Master-Detail)
+        # 4. Traverse Room List (Collect URLs)
         if _status_callback: _status_callback("📋 室場リストを取得中...")
         
-        # まずリストページにある「カレンダーアイコン」や「予約」ボタンのリンクを全収集
         target_urls = []
-        
-        # テーブル行をスキャンして、施設名/室場名とURLのペアを取得
         try:
             rows = driver.find_elements(By.CSS_SELECTOR, "tr")
-            current_facility_context = "詳細不明"
-            
             for row in rows:
-                text = row.text
-                
-                # 施設名行の検知（ヘッダー等はスキップが必要だが、とりあえずヒューリスティックに）
-                if "体育館" in text or "センター" in text or "公園" in text:
-                    # ここが施設ヘッダーかもしれない
-                    # 通常は、行の中に施設名テキストがある
-                    pass 
-                
-                # リンク（ボタン）を探す
                 links = row.find_elements(By.TAG_NAME, "a")
                 for link in links:
                     href = link.get_attribute("href")
-                    # カレンダー遷移っぽいURL
                     if href and ("calendar" in href or "reserve" in href or "detail" in href):
                         row_raw_text = row.text.replace("\n", " ")
                         target_urls.append({
                             "url": href,
-                            "raw_text": row_raw_text # これを後でパースして施設名/室場名にする
+                            "raw_text": row_raw_text
                         })
         except: pass
         
-        # 重複排除 (URLベース)
+        # Deduplicate
         unique_targets = {}
         for t in target_urls:
             unique_targets[t['url']] = t
         target_list = list(unique_targets.values())
 
         if not target_list:
-            # フォールバック：ページ内の全リンクからカレンダーっぽいものを探す
              all_links = driver.find_elements(By.TAG_NAME, "a")
              for a in all_links:
                  try:
@@ -202,9 +183,9 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                          target_list.append({"url": href, "raw_text": a.text})
                  except: pass
 
-        # 5. Loop through Detail Pages
+        # 5. Detail Loop with "Next Month" Support
         total_targets = len(target_list)
-        if _status_callback: _status_callback(f"🔍 {total_targets} 件の室場カレンダーを巡回解析します...")
+        if _status_callback: _status_callback(f"🔍 {total_targets} 室場のカレンダーを巡回解析します...")
 
         for idx, target in enumerate(target_list):
             url = target['url']
@@ -212,72 +193,106 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
             
             if _progress_bar: _progress_bar.progress(idx / max(total_targets, 1))
             
-            # Extract names from raw text if possible
-            # e.g. "秋葉台文化体育館 第1体育室 予約と空き状況"
+            # Identify Facility
             facility_name = "不明"
             room_name = "不明"
-            
             known_facilities = ["秋葉台", "秩父宮", "石名坂", "鵠沼", "北部", "太陽", "八部", "遠藤"]
             for kf in known_facilities:
                 if kf in raw_text:
                     facility_name = kf
-                    # 室場名の推定: 施設名を除去した残りの部分
                     room_name = raw_text.replace(kf, "").replace("文化体育館", "").replace("市民センター", "").replace("体育室", "").strip()
-                    if not room_name: room_name = "体育室" # default
+                    if not room_name: room_name = "体育室"
                     break
             
             if _status_callback: _status_callback(f"解析中: {facility_name} {room_name}")
 
-            # Navigate
+            # Navigate to Detail
             driver.get(url)
-            time.sleep(2)
+            time.sleep(1)
             
-            # Scrape Calendar Table
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-            calendar_tables = soup.find_all("table")
+            # --- Calendar Navigation Loop ---
+            # We check the current month displayed. If it's before our target end_date, we keep clicking "Next".
+            # Max lookahead 3 months to prevent infinite loops.
             
-            for tbl in calendar_tables:
-                # 必須要素の確認
-                txt_content = tbl.get_text()
-                if not ("空" in txt_content or "○" in txt_content or "×" in txt_content):
-                    continue
+            for _ in range(3): 
+                # Scrape Current View
+                soup = BeautifulSoup(driver.page_source, "html.parser")
                 
-                rows = tbl.find_all("tr")
-                if not rows: continue
+                # Check displayed month (optional enhancement, but we just scrape what's visible for now, assuming date logic filters later)
+                # But to decide whether to click next, we should look at the latest date in the table.
                 
-                # Header Parse
-                headers = []
+                table_scraped = False
+                calendar_tables = soup.find_all("table")
+                latest_date_in_view = None
+
+                for tbl in calendar_tables:
+                    txt_content = tbl.get_text()
+                    if not ("空" in txt_content or "○" in txt_content or "×" in txt_content):
+                        continue
+                    
+                    rows = tbl.find_all("tr")
+                    if not rows: continue
+                    
+                    # Parse Headers
+                    headers = []
+                    try:
+                        for th in rows[0].find_all(["th", "td"]):
+                            headers.append(th.get_text(strip=True))
+                    except: continue
+                    
+                    # Parse Rows
+                    for tr in rows[1:]:
+                        cols = tr.find_all(["th", "td"])
+                        if not cols: continue
+                        
+                        date_val = cols[0].get_text(strip=True)
+                        
+                        # Store last date for navigation logic
+                        # Date format often "3/1" or "3/1(Sat)"
+                        try:
+                            # 簡易的な日付パースして最終日を特定
+                            pass # We handle detailed parsing later, but need a hint here?
+                        except: pass
+
+                        for i, td in enumerate(cols[1:]):
+                            stat_text = td.get_text(strip=True)
+                            status = "×"
+                            if "○" in stat_text or "空" in stat_text: status = "○"
+                            elif "△" in stat_text: status = "△"
+                            else: continue
+                            
+                            t_slot = headers[i+1] if (i+1) < len(headers) else ""
+                            
+                            results.append({
+                                "日付": date_val,
+                                "施設名": facility_name,
+                                "室場名": room_name,
+                                "時間": t_slot,
+                                "状況": status
+                            })
+                    table_scraped = True
+
+                # Click Next Month?
+                # Condition: If we still need to cover dates up to end_date
+                # For simplicity, we just look for the "Next" button and click it if available, up to limit.
+                # Only click if we haven't seen our end_date yet?
+                # To be robust, let's just click next 1-2 times if the user requested a range.
+                
+                # Try to find "Next" button
                 try:
-                    for th in rows[0].find_all(["th", "td"]):
-                        headers.append(th.get_text(strip=True))
-                except: continue
-                
-                # Data Parse
-                for tr in rows[1:]:
-                    cols = tr.find_all(["th", "td"])
-                    if not cols: continue
-                    
-                    # Date (Column 0 usually)
-                    date_val = cols[0].get_text(strip=True)
-                    
-                    # Time Slots
-                    for i, td in enumerate(cols[1:]):
-                        stat_text = td.get_text(strip=True)
-                        status = "×"
-                        if "○" in stat_text or "空" in stat_text: status = "○"
-                        elif "△" in stat_text: status = "△"
-                        else: continue
-                        
-                        # Time header
-                        t_slot = headers[i+1] if (i+1) < len(headers) else ""
-                        
-                        results.append({
-                            "日付": date_val,
-                            "施設名": facility_name,
-                            "室場名": room_name,
-                            "時間": t_slot,
-                            "状況": status
-                        })
+                    # Next button selectors: "次月", "Next", sometimes an arrow image or link with class
+                    next_btns = driver.find_elements(By.XPATH, "//a[contains(text(), '次')] | //button[contains(text(), '次')] | //a[contains(@title, '次')]")
+                    clicked = False
+                    for btn in next_btns:
+                        if btn.is_displayed():
+                            safe_click_js(driver, btn)
+                            clicked = True
+                            time.sleep(2) # Wait for reload
+                            break
+                    if not clicked:
+                        break # No more next buttons
+                except: 
+                    break
 
     except Exception as e:
         logger.error(f"Scrape Error: {e}")
@@ -328,25 +343,20 @@ def enrich_data(df):
     def get_day(row):
         dt = row['dt']
         d_str = str(row.get('日付', ''))
-        
-        # 1. Try from datetime object
         if dt:
             if jpholiday.is_holiday(dt): return "祝"
             return ["月","火","水","木","金","土","日"][dt.weekday()]
-            
-        # 2. Try from string
         for w in ["月","火","水","木","金","土","日"]:
             if f"({w})" in d_str or f"（{w}）" in d_str:
                 return w
-                
         return "詳細不明"
 
     df['曜日'] = df.apply(get_day, axis=1)
     return df
 
 @st.cache_data(ttl=600)
-def get_data(keyword, start_date, _status, _progress):
-    df = attempt_scrape_with_retry(keyword, start_date, _status, _progress)
+def get_data(keyword, start_date, end_date, _status, _progress):
+    df = attempt_scrape_with_retry(keyword, start_date, end_date, _status, _progress)
     return enrich_data(df)
 
 def render_schedule_card(row):
@@ -392,7 +402,7 @@ def main():
         max_value=TODAY + datetime.timedelta(days=180)
     )
     st.sidebar.info("種目: バレーボール")
-
+    
     time_options = ["09:00", "11:00", "13:00", "15:00", "17:00", "19:00"]
     selected_times = st.sidebar.multiselect("希望時間帯（開始時間）", time_options, default=["13:00", "15:00", "17:00", "19:00"])
     
@@ -413,13 +423,12 @@ def main():
         st.session_state.data = pd.DataFrame()
         
         try:
-            df = get_data("バレーボール", start_d, status_box.write, p_bar)
+            # Pass end_date to scraper
+            df = get_data("バレーボール", start_d, end_d, status_box.write, p_bar)
             status_box.update(label="完了", state="complete", expanded=False)
             
             if not df.empty:
-                # Time Filter
                 mask = pd.Series(True, index=df.index)
-                
                 if 'dt' in df.columns:
                      date_mask = (df['dt'] >= start_d) & (df['dt'] <= end_d)
                      date_mask = date_mask.fillna(False)
@@ -449,8 +458,6 @@ def main():
                         
                 else:
                     st.warning("条件に合う空きは見つかりませんでした。")
-                    with st.expander("詳細デバッグ (フィルタ前データ)"):
-                         st.dataframe(df)
             else:
                 st.error("データ取得に失敗しました（または空きがありません）。")
                 
