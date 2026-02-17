@@ -309,7 +309,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
 
         # Wait for Results
         try:
-            if _status_callback: _status_callback("⏳ 検索結果リス待待機中...")
+            if _status_callback: _status_callback("⏳ 検索結果リスト待機中...")
             wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '市民センター')]")))
         except:
             if _status_callback: _status_callback("⚠️ コンテキストロストの可能性。結果フレームを再探索します...")
@@ -329,12 +329,8 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                  if _progress_bar: _progress_bar.progress(idx / max(total_targets, 1))
                  if _status_callback: _status_callback(f"📍 処理中 ({idx+1}/{total_targets}): {fac} ...")
                  
-                 # 0. Ensure we are on the list page (Check for search button or list headers)
-                 # If we just came back, we might need to verify frame again
+                 # 0. Ensure we are on the list page
                  found_context = switch_to_target_frame(driver, "市民センター", None)
-                 
-                 # 1. Expand Accordions (Must be done every time we return to list)
-                 # But first, we need to find the specific facility.
                  
                  search_key = fac[:2]
                  if not search_key: continue
@@ -342,77 +338,100 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                  is_click_success = False
                  
                  try:
-                     # Find Header FRESHLY
+                     # 1. FIND HEADER FRESHLY
+                     # We use find_elements so we don't crash if not found
                      xpath_header = f"//*[contains(text(), '{search_key}')]"
-                     candidates = driver.find_elements(By.XPATH, xpath_header)
+                     logger.info(f"Looking for header: {xpath_header}")
                      
-                     if not candidates:
-                         logger.warning(f"Header for {fac} not found.")
+                     # Wait explicitly for at least one candidate
+                     try:
+                         # Quick wait to ensure list is loaded
+                         wait.until(EC.presence_of_element_located((By.XPATH, xpath_header)))
+                     except:
+                         logger.warning(f"Header for {fac} not visible.")
                          continue
 
+                     candidates = driver.find_elements(By.XPATH, xpath_header)
+                     
+                     # Iterate candidates just in case multiple matches, but usually first valid one is it
                      for cand in candidates:
                          if not cand.is_displayed(): continue
                          
                          try:
-                             # SCOPED LOGIC
-                             if _status_callback: _status_callback(f"🔎 {fac} のアコーディオンを探索中...")
-                             
-                             # Find toggle relative to header
+                             # 2. CHECK & EXPAND ACCORDION
+                             # Locate toggle relative to header
                              room_list_toggle = cand.find_element(By.XPATH, "./following::*[contains(text(), '室場一覧') or contains(text(), 'Room List')][1]")
                              
-                             # EXPAND IT
+                             # Always try to expand. 
+                             # Even if open, clicking usually doesn't hurt unless it toggles shut.
+                             # But user says it resets to closed.
+                             # Let's check aria-expanded if possible, or just force click.
+                             # For safety, we scroll and click.
                              driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", room_list_toggle)
                              time.sleep(0.5)
-                             driver.execute_script("arguments[0].click();", room_list_toggle)
-                             time.sleep(1.0) # Wait for expansion
+                             
+                             # Check if we can detect expanded state? 
+                             # Assuming closed state after Back.
+                             try:
+                                 room_list_toggle.click()
+                             except:
+                                 driver.execute_script("arguments[0].click();", room_list_toggle)
+                             
+                             time.sleep(2.0) # Wait for expansion animation
 
-                             # Find Gym relative to toggle
+                             # 3. FIND TARGET ROW & BUTTON
+                             # Locate Gym relative to toggle
                              gym_row = room_list_toggle.find_element(By.XPATH, "./following::*[contains(text(), '体育室')][1]")
+                             
+                             # Check visibility of gym row to ensure expansion worked?
+                             if not gym_row.is_displayed():
+                                 # Maybe double click needed? Or it was already open and we closed it?
+                                 # Try clicking toggle again?
+                                 logger.warning("Gym row not displayed, trying toggle again...")
+                                 driver.execute_script("arguments[0].click();", room_list_toggle)
+                                 time.sleep(2.0)
                              
                              # Find Button relative to Gym
                              btn = gym_row.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '予約')][1]")
                              
                              if btn:
-                                 # CLICK!
+                                 # 4. CLICK BUTTON
                                  if _status_callback: _status_callback(f"  👉 クリック: {fac}")
                                  
-                                 # Check if href or JS
                                  href = btn.get_attribute('href')
                                  if href and "javascript" not in href:
-                                     driver.get(href) # Safe Direct Nav
+                                     driver.get(href)
                                  else:
                                      driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
                                      time.sleep(0.5)
                                      driver.execute_script("arguments[0].click();", btn)
                                  
                                  is_click_success = True
-                                 break # Break candidates loop
-                         except: 
+                                 break # Break candidates loop (found valid button)
+                                 
+                         except Exception as inner_e: 
+                             logger.warning(f"Candidate processing failed: {inner_e}")
                              continue
                      
                      if not is_click_success:
-                         logger.warning(f"Could not find button for {fac}")
+                         logger.warning(f"Could not find valid button for {fac} after checking candidates.")
                          continue
 
-                     # 3. Wait for Calendar & Scrape
-                     time.sleep(3) # Wait for nav
+                     # 5. WAIT & SCRAPE
+                     time.sleep(3) 
                      
                      # Verify Frame on Detail Page
                      found_context = switch_to_target_frame(driver, "予約状況", None)
-                     if not found_context:
-                         # Maybe still loading or error?
-                         pass
                      
                      scrape_calendar(driver, results, fac, "体育室", start_date)
                      
-                     # 4. Go Back
+                     # 6. GO BACK
                      if _status_callback: _status_callback(f"  🔙 リストに戻ります...")
                      driver.back()
-                     time.sleep(3) # Wait for list reload
+                     time.sleep(5) # Wait generously for list reload
 
                  except Exception as e:
                      logger.error(f"Error processing {fac}: {e}")
-                     # Try to recover by going back if we are not on list
                      try: driver.back() 
                      except: pass
                      time.sleep(3)
