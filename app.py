@@ -138,7 +138,6 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                     break
             
             # Step B: Click "Volleyball" (バレーボール)
-            # This might be in a submenu or list that appeared
             volley_labels = driver.find_elements(By.XPATH, "//label[contains(text(), 'バレーボール')] | //span[contains(text(), 'バレーボール')] | //a[contains(text(), 'バレーボール')]")
             for lbl in volley_labels:
                 if lbl.is_displayed():
@@ -327,7 +326,6 @@ def enrich_data(df):
                 if temp_dt < TODAY - datetime.timedelta(days=90):
                     y += 1
             if y and m and d:
-                # Correct out of range days for Feb etc.
                 try: return datetime.date(y, m, d)
                 except: return None
         except: return None
@@ -349,7 +347,7 @@ def enrich_data(df):
     df['曜日'] = df.apply(get_day, axis=1)
     return df
 
-@st.cache_data(ttl=600)
+# REMOVED @st.cache_data DECORATOR HERE TO FIX STREAMLIT ERROR
 def get_data(keyword, start_date, end_date, _status, _progress):
     df = attempt_scrape_with_retry(keyword, start_date, end_date, _status, _progress)
     return enrich_data(df)
@@ -389,6 +387,9 @@ def render_schedule_card(row):
 def main():
     st.title("🏐 湘南Bright 施設予約状況")
     
+    if "data" not in st.session_state:
+        st.session_state.data = pd.DataFrame()
+    
     st.sidebar.header("🔍 検索条件")
     d_input = st.sidebar.date_input(
         "日付範囲", 
@@ -398,11 +399,9 @@ def main():
     )
     st.sidebar.info("種目: バレーボール")
     
-    # Day Selection
     day_options = ["月", "火", "水", "木", "金", "土", "日", "祝"]
     selected_days = st.sidebar.multiselect("曜日指定", day_options, default=["土", "日", "祝"])
 
-    # Time Selection
     time_options = ["09:00", "11:00", "13:00", "15:00", "17:00", "19:00"]
     selected_times = st.sidebar.multiselect("希望時間帯（開始時間）", time_options, default=["13:00", "15:00", "17:00", "19:00"])
     
@@ -415,61 +414,64 @@ def main():
             start_d, end_d = d_input
         else:
             st.error("期間を正しく選択してください")
-            return
+            return # Don't proceed if invalid date
 
         status_box = st.status("🚀 処理中...", expanded=True)
         p_bar = status_box.progress(0)
         
-        st.session_state.data = pd.DataFrame()
-        
         try:
+            # Replaced caching with direct call and session state persistence
             df = get_data("バレーボール", start_d, end_d, status_box.write, p_bar)
+            st.session_state.data = df
             status_box.update(label="完了", state="complete", expanded=False)
             
-            if not df.empty:
-                mask = pd.Series(True, index=df.index)
-                
-                if 'dt' in df.columns:
-                     date_mask = (df['dt'] >= start_d) & (df['dt'] <= end_d)
-                     date_mask = date_mask.fillna(False)
-                     mask &= date_mask
-
-                if selected_days:
-                    day_mask = df['曜日'].isin(selected_days)
-                    mask &= day_mask
-
-                if selected_times:
-                    time_mask = pd.Series(False, index=df.index)
-                    for t in selected_times:
-                        hour_part = t.split(":")[0] 
-                        time_mask |= df['時間'].astype(str).str.contains(hour_part)
-                    mask &= time_mask
-                
-                final_df = df[mask]
-                
-                if not final_df.empty:
-                    st.success(f"{len(final_df)}件の空きが見つかりました！")
-                    try:
-                        final_df = final_df.sort_values(by=['dt', '時間', '施設名'])
-                    except: pass
-
-                    with st.expander("全体の表を見る"):
-                        st.table(final_df[['日付', '曜日', '施設名', '室場名', '時間', '状況']])
-                    
-                    st.subheader("空き状況カード")
-                    for _, row in final_df.iterrows():
-                        render_schedule_card(row)
-                        
-                else:
-                    st.warning("条件に合う空きは見つかりませんでした。")
-                    with st.expander("詳細デバッグ (フィルタ前データ)"):
-                         st.write(f"取得データ件数: {len(df)}")
-                         st.dataframe(df)
-            else:
-                st.error("データ取得に失敗しました（または空きがありません）。")
-                
         except Exception as e:
             st.error(f"エラー: {e}")
+
+    # Display Logic - Runs on every re-run if data exists
+    if not st.session_state.data.empty:
+        df = st.session_state.data.copy()
+        
+        # Determine date range for filtering (use last selected or full range)
+        start_d, end_d = d_input if (isinstance(d_input, tuple) and len(d_input) == 2) else (TODAY, TODAY + datetime.timedelta(days=14))
+        
+        mask = pd.Series(True, index=df.index)
+        
+        if 'dt' in df.columns:
+                date_mask = (df['dt'] >= start_d) & (df['dt'] <= end_d)
+                date_mask = date_mask.fillna(False)
+                mask &= date_mask
+
+        if selected_days:
+            day_mask = df['曜日'].isin(selected_days)
+            mask &= day_mask
+
+        if selected_times:
+            time_mask = pd.Series(False, index=df.index)
+            for t in selected_times:
+                hour_part = t.split(":")[0] 
+                time_mask |= df['時間'].astype(str).str.contains(hour_part)
+            mask &= time_mask
+        
+        final_df = df[mask]
+        
+        if not final_df.empty:
+            st.success(f"{len(final_df)}件の空きが見つかりました！")
+            try:
+                final_df = final_df.sort_values(by=['dt', '時間', '施設名'])
+            except: pass
+
+            with st.expander("全体の表を見る"):
+                st.table(final_df[['日付', '曜日', '施設名', '室場名', '時間', '状況']])
+            
+            st.subheader("空き状況カード")
+            for _, row in final_df.iterrows():
+                render_schedule_card(row)
+                
+        else:
+            st.warning("条件に合う空きは見つかりませんでした。")
+            with st.expander("詳細デバッグ (フィルタ前データ)"):
+                    st.dataframe(df)
 
 if __name__ == "__main__":
     main()
