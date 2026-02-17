@@ -80,6 +80,52 @@ def safe_click_js(driver, element):
     except:
         return False
 
+def switch_to_target_frame(driver, target_text="市民センター", _status_callback=None):
+    """
+    Switch to the iframe containing the target text.
+    Returns True if found (or already in correct frame), False otherwise.
+    """
+    try:
+        # 1. Check current content first
+        if target_text in driver.page_source:
+             if _status_callback: _status_callback(f"✅ ターゲット要素 '{target_text}' を現在のフレームで発見")
+             return True
+        
+        # 2. Iterate iframes
+        driver.switch_to.default_content()
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+        
+        if not frames:
+             if _status_callback: _status_callback("⚠️ iframeが見つかりません。メインコンテンツを探索します。")
+             return False
+
+        if _status_callback: _status_callback(f"🔍 {len(frames)} 件のiframeを探索中...")
+        
+        for i in range(len(frames)):
+            try:
+                driver.switch_to.default_content()
+                # Re-find to avoid stale element reference
+                current_frames = driver.find_elements(By.TAG_NAME, "iframe")
+                if i >= len(current_frames): break
+                
+                driver.switch_to.frame(current_frames[i])
+                time.sleep(0.5) # Wait for frame context
+                
+                if target_text in driver.page_source:
+                    if _status_callback: _status_callback(f"✅ iframe[{i}] 内で '{target_text}' を発見。コンテキストを固定します。")
+                    return True
+            except Exception as e:
+                logger.warning(f"Frame check error: {e}")
+                continue
+        
+        # If not found, revert to default
+        driver.switch_to.default_content()
+        return False
+        
+    except Exception as e:
+        logger.error(f"Switch context error: {e}")
+        return False
+
 def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status_callback, _progress_bar, _debug_placeholder):
     for attempt in range(MAX_RETRIES):
         try:
@@ -109,18 +155,18 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         # 1. Access New URL
         if _status_callback: _status_callback("📡 予約システムにアクセス中...")
         driver.get(TARGET_URL)
-        time.sleep(3)
-        
-        frames = driver.find_elements(By.TAG_NAME, "iframe")
-        if frames:
-            driver.switch_to.frame(0)
+        time.sleep(5) # Longer wait for payload
 
-        # 🔵 FORCE JS: Remove Obstructions
-        if _status_callback: _status_callback("🧹 画面の障害物を除去中(JS)...")
-        driver.execute_script("""
-            document.querySelectorAll('header, .alert, .announcement, #sc_header_top, .navbar, .cookie-banner').forEach(e => e.remove());
-        """)
-        time.sleep(0.5)
+        # 🔵 IFRAME DETECTION & SWITCHING
+        found_context = switch_to_target_frame(driver, "市民センター", _status_callback)
+        if not found_context:
+             if _status_callback: _status_callback("⚠️ ターゲット要素が見つかりませんでしたが、処理を続行します...")
+
+        # HIDE BANNERS (JS Force - Apply to current frame)
+        try:
+             driver.execute_script("document.querySelectorAll('header, .alert, .announcement, #sc_header_top, .navbar, .cookie-banner').forEach(e => e.remove());")
+             time.sleep(0.5)
+        except: pass
 
         # 2. Check "Civic Center" Checkbox using JS Logic
         if _status_callback: _status_callback("🏢 「市民センター」を選択中(JS)...")
@@ -164,22 +210,17 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         driver.execute_script(js_checkbox_script)
         time.sleep(1)
 
-        # 3. Input Date using JS Logic
+        # 3. Input Date using JS Logic (In current frame)
         if start_date:
             formatted_date = start_date.strftime("%Y-%m-%d")
             if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中(JS)...")
             
-            # JS to find date input and force value
             js_date_script = f"""
                 var inputs = document.querySelectorAll("input[type='date'], input.datepicker, input[type='text']");
                 var dateInp = null;
-                // Heuristic: looks like date or follows "利用日" label
-                // Let's rely on finding label "利用日"
                 var labels = document.querySelectorAll('label, span, th, b');
                 for (var i = 0; i < labels.length; i++) {{
                      if (labels[i].innerText.includes('利用日') || labels[i].innerText.includes('Date')) {{
-                         // Look for input near it
-                         // Following sibling traversal
                          var el = labels[i];
                          while (el) {{
                              el = el.nextElementSibling;
@@ -187,11 +228,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                                  dateInp = el; 
                                  break;
                              }}
-                             if (el && el.querySelector('input')) {{
-                                 dateInp = el.querySelector('input'); 
-                                 break;
-                             }}
-                            // Limit search
                             if (!el) break;
                          }}
                          if (dateInp) break;
@@ -199,17 +235,14 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                 }}
                 
                 if (!dateInp) {{
-                    // Fallback to first date type input
                     dateInp = document.querySelector("input[type='date']");
                 }}
 
                 if (dateInp) {{
                     dateInp.value = '{formatted_date}';
                     dateInp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    dateInp.dispatchEvent(new Event('input', {{bubbles: true}}));
                     return true;
                 }}
-                return false;
             """
             driver.execute_script(js_date_script)
             time.sleep(1)
@@ -217,7 +250,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         # 4. Debug Screenshot BEFORE Search
         if _debug_placeholder:
              if _status_callback: _status_callback("📸 検索実行前の状態確認...")
-             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索ボタンクリック前（入力確認）", use_column_width=True)
+             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索ボタンクリック前（入力確認 - iframe内）", use_column_width=True)
 
         # 5. Click Search Button using JS Logic
         if _status_callback: _status_callback("🔍 検索を実行中(JS)...")
@@ -239,11 +272,32 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         try:
             if _status_callback: _status_callback("⏳ 検索結果（施設リスト）の表示を待機中 (最大30秒)...")
             
-            wait.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '確認') or contains(text(), '市民センター')]")
+            # Re-verify/Switch frame if page reloaded
+            # Sometimes search causes a reload or update
+            # We assume we stay in frame or elements appear in current frame
+            # But let's check.
+            
+            # Robust wait allowing for frame checks?
+            # WebDriverWait(driver) checks in current context.
+            # If page refreshes, context might be lost.
+            
+            try:
+                # Simple check first
+                wait.until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '確認') or contains(text(), '市民センター')]")
+                    )
                 )
-            )
+            except:
+                # If timeout, try scanning frames again for result
+                 if _status_callback: _status_callback("⚠️ コンテキストロストの可能性。結果フレームを再探索します...")
+                 switch_to_target_frame(driver, "室場一覧", _status_callback)
+                 wait.until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '確認')]")
+                    )
+                )
+
             time.sleep(2) 
 
             # --- Debug Screenshot: After Results Loaded ---
@@ -262,7 +316,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         
         target_urls = []
         
-        # Strategy: Iterate through potential facility cards (panels/containers)
+        # Strategy: Iterate through potential facility cards
         check_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar') or contains(@href, 'reserve')]")
         
         for link in check_links:
@@ -330,6 +384,11 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             driver.get(url)
             time.sleep(2)
             
+            # Re-Verify Frame for Detail Page
+            found_context = switch_to_target_frame(driver, "予約状況", _status_callback)
+            if not found_context:
+                switch_to_target_frame(driver, "空", _status_callback) # Try other text
+
             # HIDE BANNERS (Detail Page)
             try:
                  driver.execute_script("document.querySelectorAll('header, .alert, .announcement').forEach(e => e.remove());")
