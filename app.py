@@ -47,7 +47,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 設定定数 ---
-# Direct Facility Search URL
+# Direct Facility Search URL (Video Flow)
 TARGET_URL = "https://fujisawacity.service-now.com/facilities_reservation?id=facility_search&tab=1"
 MAX_RETRIES = 3
 
@@ -115,109 +115,87 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         if frames:
             driver.switch_to.frame(0)
 
-        # 2. Check "Civic Center" Checkbox
+        # 2. Check "Civic Center" Checkbox (Strict: No text input)
         if _status_callback: _status_callback("🏢 「市民センター」を選択中...")
         
-        # Look for the Civic Center checkbox - robust strategies
+        # Clear search input if existing just in case, though instruction says just don't input.
+        try:
+            inp = driver.find_element(By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索']")
+            inp.clear()
+        except: pass
+        
+        # Click "Civic Center"
         civic_found = False
         try:
-            # Try 1: By Label text
             labels = driver.find_elements(By.XPATH, "//label[contains(text(), '市民センター')] | //span[contains(text(), '市民センター')]")
             for lbl in labels:
                 if lbl.is_displayed():
-                    # Click maybe the checkbox *before* it if label not clickable, or label itself
                     safe_click_js(driver, lbl)
                     civic_found = True
                     time.sleep(1)
                     break
-            
-            # Try 2: By Input value/id if logic requires
-            if not civic_found:
-                 # Generic heuristic click any likely checkbox near "Citizen Center" text
-                 pass
-
         except Exception as e:
             logger.warning(f"Checkbox selection warning: {e}")
 
-        # 3. Input Date
-        if start_date:
-            formatted_date = start_date.strftime("%Y-%m-%d")
-            if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中...")
-            
-            inputs_to_try = driver.find_elements(By.CSS_SELECTOR, "input[type='date'], input.datepicker, input[name*='date'], input[id*='date']")
-            for inp in inputs_to_try:
-                try:
-                    if inp.is_displayed():
-                        driver.execute_script(f"arguments[0].value = '{formatted_date}';", inp)
-                        inp.send_keys(Keys.TAB)
-                        driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", inp)
-                        time.sleep(1)
-                except: pass
-
-        # 4. Click Search Button (Explicit JS Click)
-        if _status_callback: _status_callback("🔍 検索を実行中...")
+        # 3. Click Search Button immediately (Video Flow)
+        if _status_callback: _status_callback("🔍 検索を実行中（施設名入力なし）...")
         
         search_btns = driver.find_elements(By.XPATH, "//button[contains(text(), '検索')] | //input[@type='button' and @value='検索'] | //a[contains(text(), '検索') and contains(@class, 'btn')]")
-        btn_clicked = False
         for btn in search_btns:
             if btn.is_displayed():
                 driver.execute_script("arguments[0].click();", btn)
-                btn_clicked = True
-                time.sleep(2) 
                 break
+        time.sleep(3)
 
-        # Wait for Room List (Table)
+        # Wait for Facility List
         try:
-            if _status_callback: _status_callback("⏳ 室場リストの表示を待機中 (最大30秒)...")
-            wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "tr")))
+            if _status_callback: _status_callback("⏳ 施設リストの表示を待機中 (最大30秒)...")
+            wait.until(EC.presence_of_all_elements_located((By.CLASS_NAME, "panel"))) # Assuming cards are panels or similar
         except:
-             if _status_callback: _status_callback("⚠️ 室場リストが見つかりませんでした。リトライします。")
-             raise Exception("Room list not found")
+             # Fallback wait for tr or general content
+             wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "a")))
 
-        # 5. Traverse Room List (Collect URLs & Filter for "Selected Facility" + "Gymnasium")
-        target_urls = []
-        try:
-            # We assume a list structure (e.g., table rows or list items)
-            # Strategy: Find all clickable links that are "Check Availability/Reserve"
-            # And then check their context (parent row/container) for Facility Name + "Gymnasium"
-            
-            # Find all potential "Check" buttons/links
-            check_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar') or contains(@href, 'reserve')]")
-            
-            for link in check_links:
-                href = link.get_attribute("href")
-                if not href: continue
-                
-                # Get surrounding text (parent row or container)
-                try:
-                    # Get parent TR or Div
-                    parent = link.find_element(By.XPATH, "./ancestor::tr | ./ancestor::div[contains(@class, 'card') or contains(@class, 'item')]")
-                    row_text = parent.text.replace("\n", " ")
-                except:
-                    # Fallback to link's own text + simple parent
-                    row_text = link.text
-                
-                # Filter Logic:
-                # 1. MUST contain "Gymnasium" (体育室) - User Requirement
-                # 2. MUST contain one of the Selected Facilities (e.g. "Chogo") - User Requirement
-                
-                has_gym = "体育室" in row_text
-                
-                has_facility = False
-                if selected_facilities:
-                     has_facility = any(f in row_text for f in selected_facilities)
-                else: 
-                     has_facility = True # Should not happen given UI default
-
-                if has_gym and has_facility:
-                    target_urls.append({
-                        "url": href,
-                        "raw_text": row_text
-                    })
-
-        except Exception as e: 
-            logger.warning(f"List parsing warning: {e}")
+        # 4. Filter Results: Find specific Facility Card -> "Gymnasium" Row
+        if _status_callback: _status_callback(f"📍 対象施設 ({selected_facilities}) を探索中...")
         
+        target_urls = []
+        
+        # Strategy: Iterate through potential facility cards (panels/containers)
+        # In ServiceNow portals, items are often in repeated containers
+        # We look for containers that have the Facility Name
+        
+        # Get all major containers
+        # Heuristic: Elements containing text matching our facilities
+        
+        # Let's find links directly since structure can vary
+        # Find all "Check Availability/Reserve" links first
+        check_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar') or contains(@href, 'reserve')]")
+        
+        for link in check_links:
+            try:
+                # Upward traversal to find context
+                parent = link.find_element(By.XPATH, "./ancestor::tr | ./ancestor::div[contains(@class, 'panel') or contains(@class, 'card') or contains(@class, 'list-group-item')]")
+                context_text = parent.text.replace("\n", " ")
+                
+                # Filter 1: Must be one of the selected facilities
+                if selected_facilities:
+                    is_target_facility = any(f in context_text for f in selected_facilities)
+                else:
+                    is_target_facility = True
+                
+                # Filter 2: Must be "Gymnasium" (体育室) - exact match preferred or contains
+                is_gym = "体育室" in context_text
+                
+                if is_target_facility and is_gym:
+                    href = link.get_attribute("href")
+                    if href:
+                        target_urls.append({
+                            "url": href,
+                            "raw_text": context_text
+                        })
+            except:
+                continue
+                
         # Deduplicate
         unique_targets = {}
         for t in target_urls:
@@ -227,7 +205,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         if not target_list:
             raise Exception("条件に一致する施設（体育室）が見つかりませんでした (0件)")
 
-        # 6. Detail Loop with Navigation
+        # 5. Detail Loop (Calendar)
         total_targets = len(target_list)
         if _status_callback: _status_callback(f"🔍 {total_targets} 件の体育室が見つかりました。詳細カレンダーを巡回します...")
 
@@ -244,16 +222,33 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             for kf in known_facilities:
                 if kf in raw_text:
                     facility_name = kf
-                    room_name = raw_text.replace(kf, "").replace("文化体育館", "").replace("市民センター", "").replace("体育室", "").strip()
-                    if not room_name: room_name = "体育室"
+                    # Simple extraction
+                    room_name = "体育室" 
                     break
             
             if _status_callback: _status_callback(f"解析中 ({idx+1}/{total_targets}): {facility_name} {room_name}")
 
             # Navigate to Detail
             driver.get(url)
-            time.sleep(1)
+            time.sleep(2)
             
+            # --- Important: Setting Date on Calendar Page ---
+            # If we didn't set date on search, we need to ensure we navigate to the start_date
+            # Or just rely on "Next" until we hit needed range.
+            # But usually it's better to try setting date if input exists.
+            if start_date:
+                try:
+                     f_date = start_date.strftime("%Y-%m-%d")
+                     c_inp = driver.find_elements(By.CSS_SELECTOR, "input[type='date'], input.datepicker")
+                     for ci in c_inp:
+                         if ci.is_displayed():
+                             driver.execute_script(f"arguments[0].value = '{f_date}';", ci)
+                             ci.send_keys(Keys.TAB)
+                             # triggering change might reload calendar
+                             driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", ci)
+                             time.sleep(2)
+                except: pass
+
             # --- Calendar Loop ---
             for _ in range(5): 
                 soup = BeautifulSoup(driver.page_source, "html.parser")
@@ -336,6 +331,7 @@ def enrich_data(df):
         if not isinstance(d_str, str): return None
         try:
             clean = d_str.split('(')[0].strip()
+            # Handle MM-DD or YYYY-MM-DD
             clean = clean.replace('年', '/').replace('月', '/').replace('日', '').replace('-', '/').replace('.', '/')
             parts = [p for p in clean.split('/') if p.strip()]
             y, m, d = None, None, None
@@ -374,7 +370,6 @@ def enrich_data(df):
     return df
 
 def get_data(keyword, start_date, end_date, selected_facilities, _status, _progress):
-    # Removed keyword argument from internal call as we use generic search now
     df = attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status, _progress)
     return enrich_data(df)
 
@@ -450,9 +445,6 @@ def main():
         p_bar = status_box.progress(0)
         
         try:
-            # We pass keyword just as placeholder or remove it. 
-            # get_data signature: (keyword, start_date, end_date...). 
-            # Updated get_data to ignore keyword effectively.
             df = get_data("バレーボール", start_d, end_d, selected_target_facilities, status_box.write, p_bar)
             st.session_state.data = df
             status_box.update(label="完了", state="complete", expanded=False)
