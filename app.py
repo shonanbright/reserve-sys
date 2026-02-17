@@ -146,392 +146,277 @@ def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status
                 time.sleep(3)
     return pd.DataFrame()
 
+def scrape_calendar(driver, results, facility_name, room_name, start_date):
+    """
+    Helper function to scrape the calendar instructions once on the page.
+    """
+    # JS Date Update if needed
+    if start_date:
+        formatted_date = start_date.strftime("%Y-%m-%d")
+        driver.execute_script(f"""
+            var inps = document.querySelectorAll("input[type='date'], input.datepicker");
+            inps.forEach(inp => {{
+                inp.value = '{formatted_date}';
+                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }});
+        """)
+        time.sleep(1)
+
+    for _ in range(5): 
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        calendar_tables = soup.find_all("table")
+        
+        found_table = False
+        for tbl in calendar_tables:
+            txt_content = tbl.get_text()
+            if not ("空" in txt_content or "○" in txt_content or "×" in txt_content):
+                continue
+            
+            rows = tbl.find_all("tr")
+            if not rows: continue
+            
+            headers = []
+            try:
+                for th in rows[0].find_all(["th", "td"]):
+                    headers.append(th.get_text(strip=True))
+            except: continue
+            
+            for tr in rows[1:]:
+                cols = tr.find_all(["th", "td"])
+                if not cols: continue
+                
+                date_val = cols[0].get_text(strip=True)
+                
+                for i, td in enumerate(cols[1:]):
+                    stat_text = td.get_text(strip=True)
+                    status = "×"
+                    if "○" in stat_text or "空" in stat_text: status = "○"
+                    elif "△" in stat_text: status = "△"
+                    else: continue
+                    
+                    t_slot = headers[i+1] if (i+1) < len(headers) else ""
+                    
+                    results.append({
+                        "日付": date_val,
+                        "施設名": facility_name,
+                        "室場名": room_name,
+                        "時間": t_slot,
+                        "状況": status
+                    })
+            found_table = True
+
+        if _ >= 3: 
+            break
+
+        try:
+            # Click Next Month
+            driver.execute_script("""
+                var btns = document.querySelectorAll("a, button");
+                for (var i=0; i<btns.length; i++) {
+                    if (btns[i].innerText.includes('次') || btns[i].title.includes('次') || btns[i].className.includes('next')) {
+                        btns[i].click();
+                        break;
+                    }
+                }
+            """)
+            time.sleep(2)
+        except: 
+            break
+
 def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facilities=None, _status_callback=None, _progress_bar=None, _debug_placeholder=None, attempt_idx=0):
     driver = setup_driver()
     wait = WebDriverWait(driver, 30) 
     results = []
 
     try:
-        # 1. Access New URL
+        # 1. Access New URL & Initial Setup
         if _status_callback: _status_callback("📡 予約システムにアクセス中...")
         driver.get(TARGET_URL)
         time.sleep(5) 
 
-        # 🔵 IFRAME DETECTION & SWITCHING
-        found_context = switch_to_target_frame(driver, "市民センター", _status_callback)
-        if not found_context:
-             if _status_callback: _status_callback("⚠️ ターゲット要素が見つかりませんでしたが、処理を続行します...")
+        # Initial Search Logic
+        def perform_initial_search():
+             # IFRAME & PREP
+             found = switch_to_target_frame(driver, "市民センター", _status_callback)
+             if not found:
+                 if _status_callback: _status_callback("⚠️ ターゲット要素が見つかりませんが続行します...")
 
-        # HIDE BANNERS 
-        try:
-             driver.execute_script("document.querySelectorAll('header, .alert, .announcement, #sc_header_top, .navbar, .cookie-banner').forEach(e => e.remove());")
+             try:
+                 driver.execute_script("document.querySelectorAll('header, .alert, .announcement, #sc_header_top, .navbar, .cookie-banner').forEach(e => e.remove());")
+             except: pass
+
+             # Check "Civic Center"
+             js_checkbox_script = """
+                 var labels = document.querySelectorAll('label, span');
+                 var targetLabel = null;
+                 for (var i = 0; i < labels.length; i++) {
+                     if (labels[i].innerText.includes('市民センター')) {
+                         targetLabel = labels[i];
+                         break;
+                     }
+                 }
+                 if (targetLabel) {
+                     var inp = targetLabel.querySelector('input[type="checkbox"]');
+                     if (!inp) {
+                         var prev = targetLabel.previousElementSibling;
+                         if (prev && prev.type === 'checkbox') inp = prev;
+                     }
+                     if (!inp && targetLabel.getAttribute('for')) {
+                         inp = document.getElementById(targetLabel.getAttribute('for'));
+                     }
+                     if (inp) {
+                         if (!inp.checked) {
+                             inp.click(); 
+                             if (!inp.checked) {
+                                 inp.checked = true; 
+                                 inp.dispatchEvent(new Event('change', {bubbles: true}));
+                             }
+                         }
+                         return true;
+                     }
+                 }
+                 return false;
+             """
+             driver.execute_script(js_checkbox_script)
              time.sleep(0.5)
-        except: pass
 
-        # 2. Check "Civic Center" Checkbox using JS Logic
-        if _status_callback: _status_callback("🏢 「市民センター」を選択中(JS)...")
-        
-        js_checkbox_script = """
-            var labels = document.querySelectorAll('label, span');
-            var targetLabel = null;
-            for (var i = 0; i < labels.length; i++) {
-                if (labels[i].innerText.includes('市民センター')) {
-                    targetLabel = labels[i];
-                    break;
-                }
-            }
-            if (targetLabel) {
-                var inp = targetLabel.querySelector('input[type="checkbox"]');
-                if (!inp) {
-                    var prev = targetLabel.previousElementSibling;
-                    if (prev && prev.type === 'checkbox') inp = prev;
-                }
-                if (!inp && targetLabel.getAttribute('for')) {
-                    inp = document.getElementById(targetLabel.getAttribute('for'));
-                }
-                if (inp) {
-                    if (!inp.checked) {
-                        inp.click(); 
-                        if (!inp.checked) {
-                            inp.checked = true; 
-                            inp.dispatchEvent(new Event('change', {bubbles: true}));
-                        }
-                    }
-                    return true;
-                }
-            }
-            return false;
-        """
-        driver.execute_script(js_checkbox_script)
-        time.sleep(1)
-
-        # 3. Input Date using JS Logic (In current frame)
-        if start_date:
-            formatted_date = start_date.strftime("%Y-%m-%d")
-            if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中(JS)...")
-            
-            js_date_script = f"""
-                var inputs = document.querySelectorAll("input[type='date'], input.datepicker, input[type='text']");
-                var dateInp = null;
-                var labels = document.querySelectorAll('label, span, th, b');
-                for (var i = 0; i < labels.length; i++) {{
-                     if (labels[i].innerText.includes('利用日') || labels[i].innerText.includes('Date')) {{
-                         var el = labels[i];
-                         while (el) {{
-                             el = el.nextElementSibling;
-                             if (el && el.tagName === 'INPUT') {{
-                                 dateInp = el; 
-                                 break;
-                             }}
-                            if (!el) break;
-                         }}
-                         if (dateInp) break;
+             # Input Date
+             if start_date:
+                 fd = start_date.strftime("%Y-%m-%d")
+                 driver.execute_script(f"""
+                     var dateInp = document.querySelector("input[type='date']");
+                     if (dateInp) {{
+                         dateInp.value = '{fd}';
+                         dateInp.dispatchEvent(new Event('change', {{bubbles: true}}));
                      }}
-                }}
-                if (!dateInp) {{
-                    dateInp = document.querySelector("input[type='date']");
-                }}
-                if (dateInp) {{
-                    dateInp.value = '{formatted_date}';
-                    dateInp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    return true;
-                }}
-            """
-            driver.execute_script(js_date_script)
-            time.sleep(1)
+                 """)
+                 time.sleep(0.5)
 
-        # 4. Click Search Button using JS Logic
-        if _status_callback: _status_callback("🔍 検索を実行中(JS)...")
-        
-        js_search_script = """
-            var btns = document.querySelectorAll('button, input[type="button"], a.btn');
-            for (var i = 0; i < btns.length; i++) {
-                if (btns[i].innerText.includes('検索') || btns[i].value === '検索') {
-                    btns[i].click();
-                    return true;
-                }
-            }
-            return false;
-        """
-        driver.execute_script(js_search_script)
-        time.sleep(3)
+             # Click Search
+             if _status_callback: _status_callback("🔍 検索を実行中(JS)...")
+             driver.execute_script("""
+                 var btns = document.querySelectorAll('button, input[type="button"], a.btn');
+                 for (var i = 0; i < btns.length; i++) {
+                     if (btns[i].innerText.includes('検索') || btns[i].value === '検索') {
+                         btns[i].click();
+                         return true;
+                     }
+                 }
+             """)
+             time.sleep(3)
 
-        # Wait for Facility List
+        perform_initial_search()
+
+        # Wait for Results
         try:
-            if _status_callback: _status_callback("⏳ 検索結果（施設リスト）の表示を待機中...")
-            
-            try:
-                wait.until(
-                    EC.presence_of_element_located(
-                        (By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '確認') or contains(text(), '市民センター')]")
-                    )
-                )
-            except:
-                 if _status_callback: _status_callback("⚠️ コンテキストロストの可能性。結果フレームを再探索します...")
-                 switch_to_target_frame(driver, "室場一覧", _status_callback)
-                 
-            time.sleep(2) 
+            if _status_callback: _status_callback("⏳ 検索結果リスト待機中...")
+            wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '市民センター')]")))
+        except:
+            if _status_callback: _status_callback("⚠️ コンテキストロストの可能性。結果フレームを再探索します...")
+            switch_to_target_frame(driver, "室場一覧", _status_callback)
 
-            # --- Debug Screenshot ---
-            if _debug_placeholder:
-                _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索結果表示確認", use_column_width=True)
+        time.sleep(2) 
+        if _debug_placeholder:
+            _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索結果表示", use_column_width=True)
 
-        except Exception as e:
-             if _debug_placeholder:
-                 _debug_placeholder.image(driver.get_screenshot_as_png(), caption="エラー: 検索結果待機タイムアウト", use_column_width=True)
-             if _status_callback: _status_callback("⚠️ 検索結果の表示待機中にタイムアウトしました。")
-             raise Exception("Room list not found (Timeout)")
-
-        # 5. Filter Results: SCOPED INTERACTION
-        if _status_callback: _status_callback(f"📍 対象施設を捜索中 (Scoped Mode)...")
-        
-        target_urls = []
-        found_facilities_log = []
-        is_search_success = False
-        
+        # ------------------------------------------------------------------
+        # MAIN LOOP: Navigate -> Click -> Scrape -> Back
+        # ------------------------------------------------------------------
         if selected_facilities:
-            # First, find ALL potential facility containers.
-            # We assume a structure where facility name is in a header/label, and the "Room List" is nearby.
-            # Strategy: Find the facility name element, then define that 'area' as the scope.
-            
-            for fac in selected_facilities:
-                search_key = fac[:2]
-                if not search_key: continue
-                
-                try:
-                    # 1. SCOPE IDENTIFICATION
-                    # Find facility header/label
-                    # We look for something that contains the facility name.
-                    # This finds ALL matches, we need to iterate to ensure we get the right one that HAS a Room List.
-                    
-                    if _status_callback: _status_callback(f"🔎 施設 '{fac}' (key:{search_key}) の親コンテナを特定中...")
-                    
-                    facility_headers = driver.find_elements(By.XPATH, f"//*[contains(text(), '{search_key}')]")
-                    
-                    target_container = None
-                    for header in facility_headers:
-                        # Heuristic: The header usually is inside a panel-heading or similar.
-                        # We try to go up to a container.
-                        try:
-                            # Try to find a common ancestor that contains "室場"
-                            # Or just work relative to the header.
-                            # Let's try to find "Room List" relative to this header.
-                            # axis: following
-                            pass
-                        except: continue
+             total_targets = len(selected_facilities)
+             
+             for idx, fac in enumerate(selected_facilities):
+                 if _progress_bar: _progress_bar.progress(idx / max(total_targets, 1))
+                 if _status_callback: _status_callback(f"📍 処理中 ({idx+1}/{total_targets}): {fac} ...")
+                 
+                 # 0. Ensure we are on the list page (Check for search button or list headers)
+                 # If we just came back, we might need to verify frame again
+                 found_context = switch_to_target_frame(driver, "市民センター", None)
+                 
+                 # 1. Expand Accordions (Must be done every time we return to list)
+                 driver.execute_script("""
+                     var els = document.querySelectorAll('*');
+                     for(var i=0; i<els.length; i++){
+                         if(els[i].innerText && (els[i].innerText.includes('室場一覧') || els[i].innerText.includes('Room List')) && els[i].tagName !== 'SCRIPT'){
+                             try { els[i].click(); } catch(e) {}
+                         }
+                     }
+                 """)
+                 time.sleep(1.5)
 
-                    # Better Scoped Strategy:
-                    # Iterate through match, define scope as the block between this header and the next one? 
-                    # Easier: Use 'following' but limit search?
-                    # No, Selenium 'following' goes to end of doc. 
-                    # We need to find the container.
-                    # Assumption: The layout is cards/panels.
-                    # Let's try to find an ancestor 'div' or 'tr' that contains the header.
-                    
-                    # Implementation:
-                    # Find matching header. Get its parent/ancestor.
-                    # Check if that ancestor has "Room List" or "Gymnasium".
-                    
-                    # Let's try finding the header, then finding the NEAREST "Room List" toggle.
-                    # xpath: (//header[contains(., scan_key)]/following::*[contains(., '室場一覧')])[1]
-                    
-                    xpath_header = f"(//*[contains(text(), '{search_key}') and (contains(text(), '市民センター') or contains(text(), '公民館'))])"
-                    # If fuzzy logic is tricky, just use search_key
-                    xpath_header = f"//*[contains(text(), '{search_key}')]"
-                    
-                    candidates = driver.find_elements(By.XPATH, xpath_header)
-                    
-                    for cand in candidates:
-                         # Filter out tiny elements or script garbage
+                 # 2. Find Scope & Click
+                 search_key = fac[:2]
+                 if not search_key: continue
+                 
+                 is_click_success = False
+                 
+                 try:
+                     # Find Header
+                     xpath_header = f"//*[contains(text(), '{search_key}')]"
+                     candidates = driver.find_elements(By.XPATH, xpath_header)
+                     
+                     for cand in candidates:
                          if not cand.is_displayed(): continue
                          
-                         # Check if this candidate is actually a Facility Header
-                         # (Check context)
-                         # We'll assume the correct one will have "Room List" nearby.
-                         
-                         # 2. ACCORDION EXPANSION (SCOPED)
-                         # Look for 'Room List' relative to this candidate
                          try:
-                             # 'following::' selects everything after. We need 'descendant' or near sibling.
-                             # If card structure: Header is sibling of Body.
-                             # Body contains Room List.
-                             
-                             # Let's try to find the "Room List" button that is closest following this header.
+                             # Find toggle relative to header
                              room_list_toggle = cand.find_element(By.XPATH, "./following::*[contains(text(), '室場一覧') or contains(text(), 'Room List')][1]")
                              
-                             # Scroll to it
-                             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", room_list_toggle)
-                             time.sleep(0.5)
+                             # Expand again just in case (JS above might have missed dynamic ones)
+                             # driver.execute_script("arguments[0].click();", room_list_toggle)
                              
-                             # Expand
-                             driver.execute_script("arguments[0].click();", room_list_toggle)
-                             time.sleep(1) # Wait for animation
-                             
-                             # 3. FIND ROOM (SCOPED)
-                             # Now look for Gymnasium specifically relative to this toggle (or the container it opened)
-                             # Since we expanded it, the gymnasium row should be visible or in DOM following the toggle.
-                             
-                             # We find "Gymnasium" that is following the toggle, but BEFORE the next Room List?
-                             # No, usually safe to just find "following::*[contains(., '体育室')][1]" relative to that toggle
-                             # BUT we must be careful not to jump to next facility.
-                             # We can check distance or hierarchy?
-                             
-                             # Let's assume the hierarchy is:
-                             # Container
-                             #   Header (cand)
-                             #   Toggle (room_list_toggle)
-                             #   Content (contains Gym)
-                             
-                             # So we search for Gym relative to Toggle.
+                             # Find Gym relative to toggle
                              gym_row = room_list_toggle.find_element(By.XPATH, "./following::*[contains(text(), '体育室')][1]")
                              
-                             # 4. CLICK BUTTON (SCOPED)
-                             # Find button inside/relative to gym_row
+                             # Find Button relative to Gym
                              btn = gym_row.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '予約')][1]")
                              
                              if btn:
-                                 if _status_callback: _status_callback(f"🚀 SCOPED SUCCESS: '{fac}' のボタンを特定。")
-                                 found_facilities_log.append(f"Scoped Click: {fac}")
+                                 # CLICK!
+                                 if _status_callback: _status_callback(f"  👉 クリック: {fac}")
                                  
-                                 link_href = btn.get_attribute('href')
-                                 if link_href:
-                                     target_urls.append({"url": link_href, "raw_text": fac})
-                                     is_search_success = True
-                                     break # Done for this facility
+                                 # Check if href or JS
+                                 href = btn.get_attribute('href')
+                                 if href and "javascript" not in href:
+                                     driver.get(href) # Safe Direct Nav
                                  else:
+                                     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                                     time.sleep(0.5)
                                      driver.execute_script("arguments[0].click();", btn)
-                                     time.sleep(2)
-                                     is_search_success = True 
-                                     break
-                                     
-                         except Exception as inner_e:
-                             # Not the right header or structure
+                                 
+                                 is_click_success = True
+                                 break # Break candidates loop
+                         except: 
                              continue
-                             
-                except Exception as e:
-                    logger.warning(f"Scope search error for {fac}: {e}")
-                    continue
-        
-        # Fallback Logic
-        if not target_urls and not is_search_success:
-             if _status_callback: _status_callback("⚠️ 指定施設のボタンが見つかりません(Scoped)。代替策を試行します...")
-             # Just try to brute force any gym match
-             try:
-                 # Find ANY "Gymnasium" text then the button
-                 fallback_gym = driver.find_element(By.XPATH, "(//*[contains(text(), '体育室')])[1]")
-                 fallback_btn = fallback_gym.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '予約')][1]")
-                 
-                 link_href = fallback_btn.get_attribute('href')
-                 if link_href:
-                     target_urls.append({"url": link_href, "raw_text": "Fallback Gym"})
-                 else:
-                     driver.execute_script("arguments[0].click();", fallback_btn)
-                     pass
-             except: pass
+                     
+                     if not is_click_success:
+                         # Fallback: Just look for any gym button? No, that ruins multi-facility accuracy.
+                         logger.warning(f"Could not find button for {fac}")
+                         continue
 
-        if not target_urls and not is_search_success:
-            if _status_callback: _status_callback("❌ 有効なリンクが一つも見つかりませんでした。")
-            if _debug_placeholder:
-                html_source = driver.execute_script("return document.body.innerHTML;")
-                unique_key = f"debug_html_dump_attempt_{attempt_idx}_{int(time.time()*1000)}"
-                _debug_placeholder.text_area("Debug: HTML Context Dump", html_source[:5000], height=300, key=unique_key)
-            raise Exception("Brute force failed: No links found")
+                     # 3. Wait for Calendar & Scrape
+                     time.sleep(3) # Wait for nav
+                     
+                     # Verify Frame on Detail Page
+                     found_context = switch_to_target_frame(driver, "予約状況", None)
+                     if not found_context:
+                         # Maybe still loading or error?
+                         pass
+                     
+                     scrape_calendar(driver, results, fac, "体育室", start_date)
+                     
+                     # 4. Go Back
+                     if _status_callback: _status_callback(f"  🔙 リストに戻ります...")
+                     driver.back()
+                     time.sleep(3) # Wait for list reload
 
-        # 6. Detail Loop (Calendar)
-        if _debug_placeholder:
-            _debug_placeholder.empty()
-            _debug_placeholder.success("✅ ターゲット施設へ移動します。")
-
-        total_targets = len(target_urls)
-
-        for idx, target in enumerate(target_urls):
-            url = target['url']
-            raw_text = target['raw_text']
-            
-            if _progress_bar: _progress_bar.progress(idx / max(total_targets, 1))
-            
-            facility_name = raw_text
-            room_name = "体育室"
-            
-            driver.get(url)
-            time.sleep(2)
-            
-            found_context = switch_to_target_frame(driver, "予約状況", _status_callback)
-            if not found_context:
-                switch_to_target_frame(driver, "空", _status_callback) 
-
-            try:
-                 driver.execute_script("document.querySelectorAll('header, .alert, .announcement').forEach(e => e.remove());")
-            except: pass
-
-            if start_date:
-                formatted_date = start_date.strftime("%Y-%m-%d")
-                driver.execute_script(f"""
-                    var inps = document.querySelectorAll("input[type='date'], input.datepicker");
-                    inps.forEach(inp => {{
-                        inp.value = '{formatted_date}';
-                        inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }});
-                """)
-                time.sleep(1)
-
-            for _ in range(5): 
-                soup = BeautifulSoup(driver.page_source, "html.parser")
-                calendar_tables = soup.find_all("table")
-                
-                for tbl in calendar_tables:
-                    txt_content = tbl.get_text()
-                    if not ("空" in txt_content or "○" in txt_content or "×" in txt_content):
-                        continue
-                    
-                    rows = tbl.find_all("tr")
-                    if not rows: continue
-                    
-                    headers = []
-                    try:
-                        for th in rows[0].find_all(["th", "td"]):
-                            headers.append(th.get_text(strip=True))
-                    except: continue
-                    
-                    for tr in rows[1:]:
-                        cols = tr.find_all(["th", "td"])
-                        if not cols: continue
-                        
-                        date_val = cols[0].get_text(strip=True)
-                        
-                        for i, td in enumerate(cols[1:]):
-                            stat_text = td.get_text(strip=True)
-                            status = "×"
-                            if "○" in stat_text or "空" in stat_text: status = "○"
-                            elif "△" in stat_text: status = "△"
-                            else: continue
-                            
-                            t_slot = headers[i+1] if (i+1) < len(headers) else ""
-                            
-                            results.append({
-                                "日付": date_val,
-                                "施設名": facility_name,
-                                "室場名": room_name,
-                                "時間": t_slot,
-                                "状況": status
-                            })
-
-                if _ >= 3: 
-                    break
-
-                try:
-                    driver.execute_script("""
-                        var btns = document.querySelectorAll("a, button");
-                        for (var i=0; i<btns.length; i++) {
-                            if (btns[i].innerText.includes('次') || btns[i].title.includes('次') || btns[i].className.includes('next')) {
-                                btns[i].click();
-                                break;
-                            }
-                        }
-                    """)
-                    time.sleep(2)
-                except: 
-                    break
+                 except Exception as e:
+                     logger.error(f"Error processing {fac}: {e}")
+                     # Try to recover by going back if we are not on list
+                     try: driver.back() 
+                     except: pass
+                     time.sleep(3)
+                     continue
 
     except Exception as e:
         logger.error(f"Scrape Error: {e}")
