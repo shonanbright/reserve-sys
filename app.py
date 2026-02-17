@@ -115,31 +115,64 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         if frames:
             driver.switch_to.frame(0)
 
+        # HIDE BANNERS (JS Force)
+        try:
+             driver.execute_script("document.querySelectorAll('.alert, .notification, [class*=\"banner\"]').forEach(el => el.style.display = 'none');")
+             time.sleep(0.5)
+        except: pass
+
         # 2. Check "Civic Center" Checkbox (Strict: No text input)
         if _status_callback: _status_callback("🏢 「市民センター」を選択中...")
         
-        # Clear search input if existing just in case
+        # Clear search input strict
         try:
             inp = driver.find_element(By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索']")
             if inp.is_displayed():
-                 inp.clear()
+                 driver.execute_script("arguments[0].value = '';", inp)
         except: pass
         
-        # Click "Civic Center"
-        civic_found = False
+        # Click "Civic Center" - Force JS Check
         try:
             labels = driver.find_elements(By.XPATH, "//label[contains(text(), '市民センター')] | //span[contains(text(), '市民センター')]")
             for lbl in labels:
                 if lbl.is_displayed():
-                    safe_click_js(driver, lbl)
-                    civic_found = True
+                    # Attempt to find the checkbox input associated with this label
+                    try:
+                        # Try finding previous sibling input or input inside
+                        checkbox = lbl.find_element(By.XPATH, "./preceding-sibling::input[@type='checkbox'] | ./descendant::input[@type='checkbox']")
+                        if checkbox:
+                             driver.execute_script("arguments[0].checked = true; arguments[0].dispatchEvent(new Event('change'));", checkbox)
+                        else:
+                             # Fallback to verify if label click works
+                             safe_click_js(driver, lbl)
+                    except:
+                        safe_click_js(driver, lbl)
+                    
                     time.sleep(1)
                     break
         except Exception as e:
             logger.warning(f"Checkbox selection warning: {e}")
 
-        # 3. Click Search Button immediately (Video Flow)
-        if _status_callback: _status_callback("🔍 検索を実行中（施設名入力なし）...")
+        # 3. Input Date (Force JS Injection)
+        if start_date:
+            formatted_date = start_date.strftime("%Y-%m-%d")
+            if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中(JS強制)...")
+            
+            inputs_to_try = driver.find_elements(By.CSS_SELECTOR, "input[type='date'], input.datepicker, input[name*='date'], input[id*='date']")
+            for inp in inputs_to_try:
+                try:
+                    if inp.is_displayed():
+                        # JS Force Value
+                        driver.execute_script(f"arguments[0].value = '{formatted_date}';", inp)
+                        # Fire change event
+                        driver.execute_script("arguments[0].dispatchEvent(new Event('change')); arguments[0].dispatchEvent(new Event('input'));", inp)
+                        time.sleep(0.5)
+                        inp.send_keys(Keys.TAB)
+                        time.sleep(1)
+                except: pass
+
+        # 4. Click Search Button immediately (JS Force)
+        if _status_callback: _status_callback("🔍 検索を実行中(JS強制)...")
         
         search_btns = driver.find_elements(By.XPATH, "//button[contains(text(), '検索')] | //input[@type='button' and @value='検索'] | //a[contains(text(), '検索') and contains(@class, 'btn')]")
         for btn in search_btns:
@@ -149,27 +182,19 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         
         # --- Debug Screenshot 1: After Search Click ---
         if _debug_placeholder:
-             time.sleep(1) # Wait a bit for click effect
+             time.sleep(2) 
              _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索ボタンクリック直後", use_column_width=True)
 
         # Wait for Facility List (Text Detection)
         try:
             if _status_callback: _status_callback("⏳ 検索結果（施設リスト）の表示を待機中 (最大30秒)...")
             
-            # Robust generic wait for text that suggests success
-            # Example: "一覧" (List), "詳細" (Detail), or any of the facility names if they appear
-            # Let's wait for body to contain some result-like text or just element presence
-            
-            # Specific wait for text appearing in the result area
-            # We wait for "市民センター" to appear in the results area (assuming list repeats "Civic Center")
-            # OR "室場" (Room) if accessible immediately
-            
             wait.until(
                 EC.presence_of_element_located(
                     (By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '確認') or contains(text(), '市民センター')]")
                 )
             )
-            time.sleep(2) # Stabilize
+            time.sleep(2) 
 
             # --- Debug Screenshot 2: After Results Loaded ---
             if _debug_placeholder:
@@ -182,7 +207,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
              if _status_callback: _status_callback("⚠️ 検索結果の表示待機中にタイムアウトしました。")
              raise Exception("Room list not found (Timeout)")
 
-        # 4. Filter Results: Find specific Facility Card -> "Gymnasium" Row
+        # 5. Filter Results: Find specific Facility Card -> "Gymnasium" Row
         if _status_callback: _status_callback(f"📍 対象施設 ({selected_facilities}) を探索中...")
         
         target_urls = []
@@ -202,7 +227,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                 else:
                     is_target_facility = True
                 
-                # Filter 2: Must be "Gymnasium" (体育室) - exact match preferred or contains
+                # Filter 2: Must be "Gymnasium" (体育室) 
                 is_gym = "体育室" in context_text
                 
                 if is_target_facility and is_gym:
@@ -227,11 +252,10 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             raise Exception("条件に一致する施設（体育室）が見つかりませんでした (0件)")
 
         if _debug_placeholder:
-            _debug_placeholder.empty() # Clear debug shots if successful to reduce clutter? Or keep last one.
-            # Keeping last one is better for "Success" confirmation
+            _debug_placeholder.empty()
             _debug_placeholder.success("✅ ターゲット施設を特定しました。カレンダー解析を開始します。")
 
-        # 5. Detail Loop (Calendar)
+        # 6. Detail Loop (Calendar)
         total_targets = len(target_list)
         if _status_callback: _status_callback(f"🔍 {total_targets} 件の体育室が見つかりました。詳細カレンダーを巡回します...")
 
@@ -257,7 +281,12 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             driver.get(url)
             time.sleep(2)
             
-            # Date Input (Optional but recommended)
+            # HIDE BANNERS (Again for detail page)
+            try:
+                 driver.execute_script("document.querySelectorAll('.alert, .notification, [class*=\"banner\"]').forEach(el => el.style.display = 'none');")
+            except: pass
+
+            # Date Input Force (If present)
             if start_date:
                 try:
                      f_date = start_date.strftime("%Y-%m-%d")
@@ -265,9 +294,10 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                      for ci in c_inp:
                          if ci.is_displayed():
                              driver.execute_script(f"arguments[0].value = '{f_date}';", ci)
-                             ci.send_keys(Keys.TAB)
                              driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", ci)
-                             time.sleep(2)
+                             time.sleep(1)
+                             ci.send_keys(Keys.TAB) # Sometimes needed to trigger reload
+                             time.sleep(1)
                 except: pass
 
             # --- Calendar Loop ---
@@ -331,6 +361,10 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
 
     except Exception as e:
         logger.error(f"Scrape Error: {e}")
+        # Debug screenshot on error
+        if _debug_placeholder:
+             try: _debug_placeholder.image(driver.get_screenshot_as_png(), caption=f"Error: {str(e)}", use_column_width=True)
+             except: pass
         raise e
     finally:
         driver.quit()
