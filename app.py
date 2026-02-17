@@ -109,7 +109,7 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
         if frames:
             driver.switch_to.frame(0)
 
-        # 2. Date Input
+        # 2. Date Input (Start Date)
         if start_date:
             formatted_date = start_date.strftime("%Y-%m-%d")
             if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中...")
@@ -210,21 +210,13 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
             driver.get(url)
             time.sleep(1)
             
-            # --- Calendar Navigation Loop ---
-            # We check the current month displayed. If it's before our target end_date, we keep clicking "Next".
-            # Max lookahead 3 months to prevent infinite loops.
-            
+            # --- Calendar Navigation Loop (Up to 3 months) ---
             for _ in range(3): 
                 # Scrape Current View
                 soup = BeautifulSoup(driver.page_source, "html.parser")
-                
-                # Check displayed month (optional enhancement, but we just scrape what's visible for now, assuming date logic filters later)
-                # But to decide whether to click next, we should look at the latest date in the table.
-                
-                table_scraped = False
                 calendar_tables = soup.find_all("table")
-                latest_date_in_view = None
-
+                
+                table_found = False
                 for tbl in calendar_tables:
                     txt_content = tbl.get_text()
                     if not ("空" in txt_content or "○" in txt_content or "×" in txt_content):
@@ -246,13 +238,6 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                         if not cols: continue
                         
                         date_val = cols[0].get_text(strip=True)
-                        
-                        # Store last date for navigation logic
-                        # Date format often "3/1" or "3/1(Sat)"
-                        try:
-                            # 簡易的な日付パースして最終日を特定
-                            pass # We handle detailed parsing later, but need a hint here?
-                        except: pass
 
                         for i, td in enumerate(cols[1:]):
                             stat_text = td.get_text(strip=True)
@@ -270,18 +255,12 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                                 "時間": t_slot,
                                 "状況": status
                             })
-                    table_scraped = True
+                    table_found = True
 
                 # Click Next Month?
-                # Condition: If we still need to cover dates up to end_date
-                # For simplicity, we just look for the "Next" button and click it if available, up to limit.
-                # Only click if we haven't seen our end_date yet?
-                # To be robust, let's just click next 1-2 times if the user requested a range.
-                
-                # Try to find "Next" button
                 try:
-                    # Next button selectors: "次月", "Next", sometimes an arrow image or link with class
-                    next_btns = driver.find_elements(By.XPATH, "//a[contains(text(), '次')] | //button[contains(text(), '次')] | //a[contains(@title, '次')]")
+                    # Next button selectors
+                    next_btns = driver.find_elements(By.XPATH, "//a[contains(text(), '次')] | //button[contains(text(), '次')] | //a[contains(@title, '次')] | //a[contains(@class, 'next')]")
                     clicked = False
                     for btn in next_btns:
                         if btn.is_displayed():
@@ -318,7 +297,6 @@ def enrich_data(df):
             clean = d_str.split('(')[0].strip()
             clean = clean.replace('年', '/').replace('月', '/').replace('日', '').replace('-', '/').replace('.', '/')
             parts = [p for p in clean.split('/') if p.strip()]
-            
             y, m, d = None, None, None
             
             if len(parts) == 3:
@@ -332,7 +310,6 @@ def enrich_data(df):
                 temp_dt = datetime.date(y, m, d)
                 if temp_dt < TODAY - datetime.timedelta(days=90):
                     y += 1
-            
             if y and m and d:
                 return datetime.date(y, m, d)
         except: return None
@@ -349,7 +326,7 @@ def enrich_data(df):
         for w in ["月","火","水","木","金","土","日"]:
             if f"({w})" in d_str or f"（{w}）" in d_str:
                 return w
-        return "詳細不明"
+        return "不明"
 
     df['曜日'] = df.apply(get_day, axis=1)
     return df
@@ -403,6 +380,11 @@ def main():
     )
     st.sidebar.info("種目: バレーボール")
     
+    # Day Selection
+    day_options = ["月", "火", "水", "木", "金", "土", "日", "祝"]
+    selected_days = st.sidebar.multiselect("曜日指定", day_options, default=["土", "日", "祝"])
+
+    # Time Selection
     time_options = ["09:00", "11:00", "13:00", "15:00", "17:00", "19:00"]
     selected_times = st.sidebar.multiselect("希望時間帯（開始時間）", time_options, default=["13:00", "15:00", "17:00", "19:00"])
     
@@ -423,17 +405,24 @@ def main():
         st.session_state.data = pd.DataFrame()
         
         try:
-            # Pass end_date to scraper
             df = get_data("バレーボール", start_d, end_d, status_box.write, p_bar)
             status_box.update(label="完了", state="complete", expanded=False)
             
             if not df.empty:
                 mask = pd.Series(True, index=df.index)
+                
+                # Date Filter
                 if 'dt' in df.columns:
                      date_mask = (df['dt'] >= start_d) & (df['dt'] <= end_d)
                      date_mask = date_mask.fillna(False)
                      mask &= date_mask
 
+                # Day Filter
+                if selected_days:
+                    day_mask = df['曜日'].isin(selected_days)
+                    mask &= day_mask
+
+                # Time Filter
                 if selected_times:
                     time_mask = pd.Series(False, index=df.index)
                     for t in selected_times:
@@ -458,6 +447,10 @@ def main():
                         
                 else:
                     st.warning("条件に合う空きは見つかりませんでした。")
+                    with st.expander("詳細デバッグ (フィルタ前データ)"):
+                         st.write(f"取得データ件数: {len(df)}")
+                         st.write(f"日付範囲: {start_d} ~ {end_d}")
+                         st.dataframe(df)
             else:
                 st.error("データ取得に失敗しました（または空きがありません）。")
                 
