@@ -115,60 +115,125 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         if frames:
             driver.switch_to.frame(0)
 
-        # HIDE BANNERS (JS Force)
-        try:
-             driver.execute_script("document.querySelectorAll('.alert, .notification, [class*=\"banner\"]').forEach(el => el.style.display = 'none');")
-             time.sleep(0.5)
-        except: pass
+        # 🔵 FORCE JS: Remove Obstructions
+        if _status_callback: _status_callback("🧹 画面の障害物を除去中(JS)...")
+        driver.execute_script("""
+            document.querySelectorAll('header, .alert, .announcement, #sc_header_top, .navbar, .cookie-banner').forEach(e => e.remove());
+        """)
+        time.sleep(0.5)
 
-        # 2. Check "Civic Center" Checkbox using XPath Text
-        if _status_callback: _status_callback("🏢 「市民センター」を選択中(XPath text)...")
+        # 2. Check "Civic Center" Checkbox using JS Logic
+        if _status_callback: _status_callback("🏢 「市民センター」を選択中(JS)...")
         
-        try:
-            # Find label containing '市民センター'
-            civic_label = driver.find_element(By.XPATH, "//label[contains(., '市民センター')] | //span[contains(., '市民センター')]")
-            if civic_label.is_displayed():
-                safe_click_js(driver, civic_label)
-                time.sleep(1)
-        except Exception as e:
-            logger.warning(f"Checkbox selection warning: {e}")
+        # JS to find label containing text and check its input
+        js_checkbox_script = """
+            var labels = document.querySelectorAll('label, span');
+            var targetLabel = null;
+            for (var i = 0; i < labels.length; i++) {
+                if (labels[i].innerText.includes('市民センター')) {
+                    targetLabel = labels[i];
+                    break;
+                }
+            }
+            if (targetLabel) {
+                // Try finding input inside
+                var inp = targetLabel.querySelector('input[type="checkbox"]');
+                if (!inp) {
+                    // Try preceding sibling
+                    var prev = targetLabel.previousElementSibling;
+                    if (prev && prev.type === 'checkbox') inp = prev;
+                }
+                // Try ID matching (for='id')
+                if (!inp && targetLabel.getAttribute('for')) {
+                    inp = document.getElementById(targetLabel.getAttribute('for'));
+                }
+                
+                if (inp) {
+                    if (!inp.checked) {
+                        inp.click(); // Physical click attempt first via JS
+                        if (!inp.checked) {
+                            inp.checked = true; // Force property
+                            inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    }
+                    return true;
+                }
+            }
+            return false;
+        """
+        driver.execute_script(js_checkbox_script)
+        time.sleep(1)
 
-        # 3. Input Date using XPath generic label following sibling
+        # 3. Input Date using JS Logic
         if start_date:
             formatted_date = start_date.strftime("%Y-%m-%d")
-            if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中(XPath)...")
+            if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中(JS)...")
             
-            try:
-                # Find input following "利用日" label
-                date_input = driver.find_element(By.XPATH, "//label[contains(., '利用日')]/following::input[1]")
-                if date_input.is_displayed():
-                    # Force value via JS
-                    driver.execute_script(f"arguments[0].value = '{formatted_date}';", date_input)
-                    time.sleep(0.5)
-                    # Trigger events
-                    driver.execute_script("arguments[0].dispatchEvent(new Event('change')); arguments[0].dispatchEvent(new Event('input'));", date_input)
-                    date_input.send_keys(Keys.TAB)
-                    time.sleep(1)
-            except Exception as e:
-                logger.warning(f"Date input warning: {e}")
+            # JS to find date input and force value
+            js_date_script = f"""
+                var inputs = document.querySelectorAll("input[type='date'], input.datepicker, input[type='text']");
+                var dateInp = null;
+                // Heuristic: looks like date or follows "利用日" label
+                // Let's rely on finding label "利用日"
+                var labels = document.querySelectorAll('label, span, th, b');
+                for (var i = 0; i < labels.length; i++) {{
+                     if (labels[i].innerText.includes('利用日') || labels[i].innerText.includes('Date')) {{
+                         // Look for input near it
+                         // Following sibling traversal
+                         var el = labels[i];
+                         while (el) {{
+                             el = el.nextElementSibling;
+                             if (el && el.tagName === 'INPUT') {{
+                                 dateInp = el; 
+                                 break;
+                             }}
+                             if (el && el.querySelector('input')) {{
+                                 dateInp = el.querySelector('input'); 
+                                 break;
+                             }}
+                            // Limit search
+                            if (!el) break;
+                         }}
+                         if (dateInp) break;
+                     }}
+                }}
+                
+                if (!dateInp) {{
+                    // Fallback to first date type input
+                    dateInp = document.querySelector("input[type='date']");
+                }}
+
+                if (dateInp) {{
+                    dateInp.value = '{formatted_date}';
+                    dateInp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    dateInp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    return true;
+                }}
+                return false;
+            """
+            driver.execute_script(js_date_script)
+            time.sleep(1)
 
         # 4. Debug Screenshot BEFORE Search
         if _debug_placeholder:
              if _status_callback: _status_callback("📸 検索実行前の状態確認...")
-             time.sleep(1)
-             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索ボタンクリック前（条件確認）", use_column_width=True)
+             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索ボタンクリック前（入力確認）", use_column_width=True)
 
-        # 5. Click Search Button using XPath text
-        if _status_callback: _status_callback("🔍 検索を実行中(XPath)...")
+        # 5. Click Search Button using JS Logic
+        if _status_callback: _status_callback("🔍 検索を実行中(JS)...")
         
-        try:
-            # Target button with text '検索'
-            search_btn = driver.find_element(By.XPATH, "//button[contains(., '検索')] | //input[@type='button' and @value='検索'] | //a[contains(., '検索') and contains(@class, 'btn')]")
-            if search_btn.is_displayed():
-                safe_click_js(driver, search_btn)
-                time.sleep(2)
-        except Exception as e:
-             logger.warning(f"Search button click warning: {e}")
+        js_search_script = """
+            var btns = document.querySelectorAll('button, input[type="button"], a.btn');
+            for (var i = 0; i < btns.length; i++) {
+                if (btns[i].innerText.includes('検索') || btns[i].value === '検索') {
+                    btns[i].click();
+                    return true;
+                }
+            }
+            return false;
+        """
+        driver.execute_script(js_search_script)
+        time.sleep(3)
 
         # Wait for Facility List (Text Detection)
         try:
@@ -233,8 +298,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
 
         if not target_list:
             if _status_callback: _status_callback("⚠️ 条件に一致する施設が見つかりません。")
-            # Don't throw immediately inside retry loop to observe visual
-            # But we must raise to trigger retry logic
             raise Exception("条件に一致する施設（体育室）が見つかりませんでした (0件)")
 
         if _debug_placeholder:
@@ -267,24 +330,22 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             driver.get(url)
             time.sleep(2)
             
-            # HIDE BANNERS
+            # HIDE BANNERS (Detail Page)
             try:
-                 driver.execute_script("document.querySelectorAll('.alert, .notification, [class*=\"banner\"]').forEach(el => el.style.display = 'none');")
+                 driver.execute_script("document.querySelectorAll('header, .alert, .announcement').forEach(e => e.remove());")
             except: pass
 
-            # Date Input Force (If present)
+            # Date Input Force (If present) - JS
             if start_date:
-                try:
-                     f_date = start_date.strftime("%Y-%m-%d")
-                     # Try generic XPath for detail page too just in case
-                     inp = driver.find_elements(By.XPATH, "//input[@type='date'] | //input[contains(@class, 'datepicker')]")
-                     for ci in inp:
-                         if ci.is_displayed():
-                             driver.execute_script(f"arguments[0].value = '{f_date}';", ci)
-                             driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", ci)
-                             ci.send_keys(Keys.TAB)
-                             time.sleep(1)
-                except: pass
+                formatted_date = start_date.strftime("%Y-%m-%d")
+                driver.execute_script(f"""
+                    var inps = document.querySelectorAll("input[type='date'], input.datepicker");
+                    inps.forEach(inp => {{
+                        inp.value = '{formatted_date}';
+                        inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    }});
+                """)
+                time.sleep(1)
 
             # --- Calendar Loop ---
             for _ in range(5): 
@@ -332,16 +393,17 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                     break
 
                 try:
-                    next_btns = driver.find_elements(By.XPATH, "//a[contains(text(), '次')] | //button[contains(text(), '次')] | //a[contains(@title, '次')] | //a[contains(@class, 'next')]")
-                    clicked = False
-                    for btn in next_btns:
-                        if btn.is_displayed():
-                            safe_click_js(driver, btn)
-                            clicked = True
-                            time.sleep(2)
-                            break
-                    if not clicked:
-                        break
+                    # JS Force Next Click
+                    driver.execute_script("""
+                        var btns = document.querySelectorAll("a, button");
+                        for (var i=0; i<btns.length; i++) {
+                            if (btns[i].innerText.includes('次') || btns[i].title.includes('次') || btns[i].className.includes('next')) {
+                                btns[i].click();
+                                break;
+                            }
+                        }
+                    """)
+                    time.sleep(2)
                 except: 
                     break
 
