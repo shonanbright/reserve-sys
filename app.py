@@ -71,15 +71,6 @@ def setup_driver():
         logger.error(f"Chrome Driver起動エラー: {e}")
         raise e
 
-def safe_click_js(driver, element):
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-        time.sleep(0.5)
-        driver.execute_script("arguments[0].click();", element)
-        return True
-    except:
-        return False
-
 def switch_to_target_frame(driver, target_text="市民センター", _status_callback=None):
     """
     Switch to the iframe containing the target text.
@@ -88,7 +79,6 @@ def switch_to_target_frame(driver, target_text="市民センター", _status_cal
     try:
         # 1. Check current content first
         if target_text in driver.page_source:
-             if _status_callback: _status_callback(f"✅ ターゲット要素 '{target_text}' を現在のフレームで発見")
              return True
         
         # 2. Iterate iframes
@@ -96,34 +86,26 @@ def switch_to_target_frame(driver, target_text="市民センター", _status_cal
         frames = driver.find_elements(By.TAG_NAME, "iframe")
         
         if not frames:
-             # if _status_callback: _status_callback("⚠️ iframeが見つかりません。メインコンテンツを探索します。")
              return False
 
-        if _status_callback: _status_callback(f"🔍 {len(frames)} 件のiframeを探索中...")
-        
         for i in range(len(frames)):
             try:
                 driver.switch_to.default_content()
-                # Re-find to avoid stale element reference
                 current_frames = driver.find_elements(By.TAG_NAME, "iframe")
                 if i >= len(current_frames): break
                 
                 driver.switch_to.frame(current_frames[i])
-                time.sleep(0.5) # Wait for frame context
+                time.sleep(0.5) 
                 
                 if target_text in driver.page_source:
-                    if _status_callback: _status_callback(f"✅ iframe[{i}] 内で '{target_text}' を発見。コンテキストを固定します。")
                     return True
             except Exception as e:
-                logger.warning(f"Frame check error: {e}")
                 continue
         
-        # If not found, revert to default
         driver.switch_to.default_content()
         return False
         
     except Exception as e:
-        logger.error(f"Switch context error: {e}")
         return False
 
 def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status_callback, _progress_bar, _debug_placeholder):
@@ -137,8 +119,12 @@ def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status
             if not df.empty:
                 return df
             
-            # If empty, treating as failure to trigger retry
-            raise Exception("空き情報が見つかりませんでした (0件)")
+            # If we went through loop successfully but found NO vacancies, df is empty but not error.
+            # But if we failed to even process, we might want to retry? 
+            # For now, if empty, we assume no vacancies or fail. 
+            # Let's retry only on explicit errors, which are caught below.
+            # If it returns empty DF, it means no open slots found.
+            return df
             
         except Exception as e:
             logger.error(f"Attempt {attempt+1} failed: {e}")
@@ -148,19 +134,29 @@ def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status
 
 def scrape_calendar(driver, results, facility_name, room_name, start_date):
     """
-    Helper function to scrape the calendar instructions once on the page.
+    Scrape calendar table for availability symbols.
     """
     # JS Date Update if needed
     if start_date:
         formatted_date = start_date.strftime("%Y-%m-%d")
-        driver.execute_script(f"""
-            var inps = document.querySelectorAll("input[type='date'], input.datepicker");
-            inps.forEach(inp => {{
-                inp.value = '{formatted_date}';
-                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-            }});
-        """)
-        time.sleep(1)
+        try:
+            driver.execute_script(f"""
+                var inps = document.querySelectorAll("input[type='date'], input.datepicker");
+                inps.forEach(inp => {{
+                    inp.value = '{formatted_date}';
+                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                }});
+            """)
+            time.sleep(1)
+        except: pass
+
+    # Wait for table
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.TAG_NAME, "table"))
+        )
+    except:
+        return
 
     for _ in range(5): 
         soup = BeautifulSoup(driver.page_source, "html.parser")
@@ -168,8 +164,13 @@ def scrape_calendar(driver, results, facility_name, room_name, start_date):
         
         found_table = False
         for tbl in calendar_tables:
+            # Check if this table looks like a schedule (has dates or symbols)
+            # Some tables use images for ○/×
             txt_content = tbl.get_text()
-            if not ("空" in txt_content or "○" in txt_content or "×" in txt_content):
+            has_symbols = "○" in txt_content or "×" in txt_content or "△" in txt_content
+            has_imgs = tbl.find('img', alt=re.compile(r'[○×△]')) or tbl.find('img', src=re.compile(r'(circle|cross|triangle)'))
+            
+            if not (has_symbols or has_imgs):
                 continue
             
             rows = tbl.find_all("tr")
@@ -185,24 +186,43 @@ def scrape_calendar(driver, results, facility_name, room_name, start_date):
                 cols = tr.find_all(["th", "td"])
                 if not cols: continue
                 
+                # First col is usually Date
                 date_val = cols[0].get_text(strip=True)
                 
                 for i, td in enumerate(cols[1:]):
+                    # Check text status
                     stat_text = td.get_text(strip=True)
-                    status = "×"
-                    if "○" in stat_text or "空" in stat_text: status = "○"
-                    elif "△" in stat_text: status = "△"
-                    else: continue
                     
+                    # Check image status
+                    img_alt = ""
+                    img = td.find('img')
+                    if img:
+                        img_alt = img.get('alt', '')
+                        img_src = img.get('src', '')
+                    
+                    status = "×" # Default closed
+                    
+                    if "○" in stat_text or "空" in stat_text or "○" in img_alt or "circle" in str(img_src):
+                        status = "○"
+                    elif "△" in stat_text or "△" in img_alt:
+                        status = "△"
+                    elif "×" in stat_text or "満" in stat_text or "×" in img_alt:
+                        status = "×"
+                    else:
+                        continue # Skip cells with no status info
+                    
+                    # Get Time Slot from header
+                    # Index i corresponds to headers[i+1] because first col is date
                     t_slot = headers[i+1] if (i+1) < len(headers) else ""
                     
-                    results.append({
-                        "日付": date_val,
-                        "施設名": facility_name,
-                        "室場名": room_name,
-                        "時間": t_slot,
-                        "状況": status
-                    })
+                    if status in ["○", "△"]:
+                        results.append({
+                            "日付": date_val,
+                            "施設名": facility_name,
+                            "室場名": room_name,
+                            "時間": t_slot,
+                            "状況": status
+                        })
             found_table = True
 
         if _ >= 3: 
@@ -236,11 +256,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
 
         # Initial Search Logic
         def perform_initial_search():
-             # IFRAME & PREP
              found = switch_to_target_frame(driver, "市民センター", _status_callback)
-             if not found:
-                 if _status_callback: _status_callback("⚠️ ターゲット要素が見つかりませんが続行します...")
-
              try:
                  driver.execute_script("document.querySelectorAll('header, .alert, .announcement, #sc_header_top, .navbar, .cookie-banner').forEach(e => e.remove());")
              except: pass
@@ -261,16 +277,10 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                          var prev = targetLabel.previousElementSibling;
                          if (prev && prev.type === 'checkbox') inp = prev;
                      }
-                     if (!inp && targetLabel.getAttribute('for')) {
-                         inp = document.getElementById(targetLabel.getAttribute('for'));
-                     }
                      if (inp) {
                          if (!inp.checked) {
                              inp.click(); 
-                             if (!inp.checked) {
-                                 inp.checked = true; 
-                                 inp.dispatchEvent(new Event('change', {bubbles: true}));
-                             }
+                             if (!inp.checked) { inp.checked = true; inp.dispatchEvent(new Event('change', {bubbles: true})); }
                          }
                          return true;
                      }
@@ -320,7 +330,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索結果表示", use_column_width=True)
 
         # ------------------------------------------------------------------
-        # MAIN LOOP: Navigate -> Click -> Scrape -> Back (FRESH RE-ACQUISITION)
+        # MAIN LOOP: Navigate -> Click -> Scrape -> Back (STRICT FRESH)
         # ------------------------------------------------------------------
         if selected_facilities:
              total_targets = len(selected_facilities)
@@ -339,13 +349,9 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                  
                  try:
                      # 1. FIND HEADER FRESHLY
-                     # We use find_elements so we don't crash if not found
                      xpath_header = f"//*[contains(text(), '{search_key}')]"
-                     logger.info(f"Looking for header: {xpath_header}")
                      
-                     # Wait explicitly for at least one candidate
                      try:
-                         # Quick wait to ensure list is loaded
                          wait.until(EC.presence_of_element_located((By.XPATH, xpath_header)))
                      except:
                          logger.warning(f"Header for {fac} not visible.")
@@ -353,45 +359,25 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
 
                      candidates = driver.find_elements(By.XPATH, xpath_header)
                      
-                     # Iterate candidates just in case multiple matches, but usually first valid one is it
                      for cand in candidates:
                          if not cand.is_displayed(): continue
                          
                          try:
                              # 2. CHECK & EXPAND ACCORDION
-                             # Locate toggle relative to header
                              room_list_toggle = cand.find_element(By.XPATH, "./following::*[contains(text(), '室場一覧') or contains(text(), 'Room List')][1]")
                              
-                             # Always try to expand. 
-                             # Even if open, clicking usually doesn't hurt unless it toggles shut.
-                             # But user says it resets to closed.
-                             # Let's check aria-expanded if possible, or just force click.
-                             # For safety, we scroll and click.
                              driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", room_list_toggle)
                              time.sleep(0.5)
-                             
-                             # Check if we can detect expanded state? 
-                             # Assuming closed state after Back.
-                             try:
-                                 room_list_toggle.click()
-                             except:
-                                 driver.execute_script("arguments[0].click();", room_list_toggle)
-                             
-                             time.sleep(2.0) # Wait for expansion animation
+                             driver.execute_script("arguments[0].click();", room_list_toggle)
+                             time.sleep(1.5) # Wait for expansion
 
                              # 3. FIND TARGET ROW & BUTTON
-                             # Locate Gym relative to toggle
                              gym_row = room_list_toggle.find_element(By.XPATH, "./following::*[contains(text(), '体育室')][1]")
                              
-                             # Check visibility of gym row to ensure expansion worked?
                              if not gym_row.is_displayed():
-                                 # Maybe double click needed? Or it was already open and we closed it?
-                                 # Try clicking toggle again?
-                                 logger.warning("Gym row not displayed, trying toggle again...")
                                  driver.execute_script("arguments[0].click();", room_list_toggle)
-                                 time.sleep(2.0)
+                                 time.sleep(1.5)
                              
-                             # Find Button relative to Gym
                              btn = gym_row.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '予約')][1]")
                              
                              if btn:
@@ -407,20 +393,19 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                                      driver.execute_script("arguments[0].click();", btn)
                                  
                                  is_click_success = True
-                                 break # Break candidates loop (found valid button)
+                                 break # Break candidates loop
                                  
                          except Exception as inner_e: 
-                             logger.warning(f"Candidate processing failed: {inner_e}")
                              continue
                      
                      if not is_click_success:
-                         logger.warning(f"Could not find valid button for {fac} after checking candidates.")
+                         logger.warning(f"Could not find button for {fac} after checking candidates.")
                          continue
 
                      # 5. WAIT & SCRAPE
+                     if _status_callback: _status_callback(f"  📅 カレンダー確認中: {fac}")
                      time.sleep(3) 
                      
-                     # Verify Frame on Detail Page
                      found_context = switch_to_target_frame(driver, "予約状況", None)
                      
                      scrape_calendar(driver, results, fac, "体育室", start_date)
