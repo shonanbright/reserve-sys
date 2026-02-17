@@ -119,7 +119,7 @@ def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status
             if not df.empty:
                 return df
             
-            return df # Return empty if no slots found but successful run
+            return df 
             
         except Exception as e:
             logger.error(f"Attempt {attempt+1} failed: {e}")
@@ -127,22 +127,33 @@ def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status
                 time.sleep(3)
     return pd.DataFrame()
 
-def scrape_current_calendar_page(driver, results, facility_name, room_name):
+def scrape_current_schedule_table(driver, results, facility_name, room_name):
     """
-    Scrape the CURRENTLY visible calendar table. No navigation.
+    Scrape the current schedule table (usually at the bottom) for availability symbols.
     """
     soup = BeautifulSoup(driver.page_source, "html.parser")
-    calendar_tables = soup.find_all("table")
+    # Identify tables. Usually the schedule table is the one with symbols.
+    # The calendar table has day numbers (1-31).
+    tables = soup.find_all("table")
     
-    for tbl in calendar_tables:
-        # Check if this table looks like a schedule
-        txt_content = tbl.get_text()
-        has_symbols = "○" in txt_content or "×" in txt_content or "△" in txt_content
+    for tbl in tables:
+        txt = tbl.get_text()
+        has_symbols = "○" in txt or "×" in txt or "△" in txt
         has_imgs = tbl.find('img', alt=re.compile(r'[○×△]')) or tbl.find('img', src=re.compile(r'(circle|cross|triangle)'))
+        
+        # Skip if it looks like just the monthly calendar (1-31 grid without status)
+        # Monthly calendar usually has many empty cells or just numbers, no "time" headers like 09:00.
+        # Schedule table has time headers.
+        has_time = "9:" in txt or "09:" in txt or "11:" in txt or "13:" in txt
         
         if not (has_symbols or has_imgs):
             continue
-        
+            
+        # Refine: if it has time headers, it's likely the schedule.
+        if not has_time:
+            # Maybe it's a simple status table?
+            pass
+
         rows = tbl.find_all("tr")
         if not rows: continue
         
@@ -156,32 +167,31 @@ def scrape_current_calendar_page(driver, results, facility_name, room_name):
             cols = tr.find_all(["th", "td"])
             if not cols: continue
             
-            # First col is usually Date
             date_val = cols[0].get_text(strip=True)
             
             for i, td in enumerate(cols[1:]):
-                # Check text status
                 stat_text = td.get_text(strip=True)
-                
-                # Check image status
-                img_alt = ""
                 img = td.find('img')
-                if img:
-                    img_alt = img.get('alt', '')
-                    img_src = img.get('src', '')
                 
                 status = "×" # Default closed
                 
-                if "○" in stat_text or "空" in stat_text or "○" in img_alt or "circle" in str(img_src):
-                    status = "○"
-                elif "△" in stat_text or "△" in img_alt:
-                    status = "△"
-                elif "×" in stat_text or "満" in stat_text or "×" in img_alt:
-                    status = "×"
-                else:
-                    continue 
+                # Check Text
+                if "○" in stat_text or "空" in stat_text: status = "○"
+                elif "△" in stat_text: status = "△"
+                elif "×" in stat_text or "満" in stat_text: status = "×"
                 
-                # Get Time Slot from header
+                # Check Image
+                if img:
+                    alt = img.get('alt', '')
+                    src = img.get('src', '')
+                    if "○" in alt or "circle" in src: status = "○"
+                    elif "△" in alt: status = "△"
+                    elif "×" in alt or "cross" in src: status = "×"
+                
+                if status == "×" and not ("×" in stat_text or (img and ("×" in img.get('alt','') or "cross" in img.get('src','')))):
+                    # Sometimes cells are empty means nothing available or closed.
+                    pass
+
                 t_slot = headers[i+1] if (i+1) < len(headers) else ""
                 
                 if status in ["○", "△"]:
@@ -192,35 +202,109 @@ def scrape_current_calendar_page(driver, results, facility_name, room_name):
                         "時間": t_slot,
                         "状況": status
                     })
-        return True # Found and scraped a table
+        return True
     return False
 
-def click_next_week_button(driver):
+def process_month_calendar_clicks(driver, results, facility_name):
     """
-    Find and click the 'Next' button (Next Week/Month).
+    Find the monthly calendar, identify Sunday/Saturday cells, click them,
+    and scrape the resulting schedule table.
     """
+    # 1. Locate the Monthly Calendar Table
+    # It usually contains 1..31. And headers "日", "月"...
+    # We want to click "日" (Sunday) columns => usually 1st column in calendar layout.
+    
+    # Strategy: Find all tables. Check for "日" header.
+    # Then get all cells in that column index.
+    
+    wait = WebDriverWait(driver, 5)
+    
+    # Try to find calendar table
     try:
-        # Look for typical Next/Forward buttons
-        # e.g. "次週", "次月", ">", icon classes
-        xpath_next = "//*[contains(text(), '次') or contains(@title, '次') or contains(@class, 'next') or contains(@class, 'forward')]"
+        tables = driver.find_elements(By.TAG_NAME, "table")
+        calendar_table = None
+        saturday_col_idx = -1 # Usually 6 (0-indexed)
+        sunday_col_idx = -1   # Usually 0
         
-        # Try to be more specific if possible.
-        # Often these are <a> tags with onclick or buttons.
-        btns = driver.find_elements(By.XPATH, xpath_next)
+        for tbl in tables:
+            headers = tbl.find_elements(By.TAG_NAME, "th")
+            header_texts = [h.text.strip() for h in headers]
+            if "日" in header_texts and "土" in header_texts:
+                calendar_table = tbl
+                # Find indices
+                for idx, txt in enumerate(header_texts):
+                    if "日" == txt: sunday_col_idx = idx
+                    if "土" == txt: saturday_col_idx = idx
+                break
         
-        for btn in btns:
-            if btn.is_displayed() and btn.is_enabled():
-                try:
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                    time.sleep(0.2)
-                    btn.click()
-                    return True
-                except:
-                    driver.execute_script("arguments[0].click();", btn)
-                    return True
-        return False
-    except:
-        return False
+        if not calendar_table:
+            # Fallback: Just click anything that looks like a day cell?
+            # Or use specific class if known.
+            # Let's assume standard calendar.
+            logger.warning("Calendar table not found strictly. Trying broader search.")
+            return
+
+        # 2. Collect Clickable Dates (Sundays & Saturdays)
+        # We need to collect them first because clicking one might refresh the whole page/DOM (though usually AJAX).
+        # Should we re-acquire elements after each click? YES.
+        
+        target_indices = [sunday_col_idx]
+        if saturday_col_idx != -1: target_indices.append(saturday_col_idx)
+        
+        # We iteration logic:
+        # Find table -> Find rows -> Get cells at indices -> Click -> Wait -> Scrape -> Re-find table
+        
+        # How many rows? usually 5-6.
+        # We loop by row index.
+        
+        rows = calendar_table.find_elements(By.TAG_NAME, "tr")
+        row_count = len(rows)
+        
+        for r_idx in range(1, row_count): # Skip header row 0
+            # Re-acquire table and row each time
+            try:
+                # Find table again
+                tables = driver.find_elements(By.TAG_NAME, "table")
+                cal_tbl = None
+                for t in tables:
+                    if "日" in t.text and "土" in t.text:
+                        cal_tbl = t
+                        break
+                if not cal_tbl: break
+                
+                row = cal_tbl.find_elements(By.TAG_NAME, "tr")[r_idx]
+                cols = row.find_elements(By.TAG_NAME, "td")
+                
+                for c_idx in target_indices:
+                    if c_idx < len(cols):
+                        cell = cols[c_idx]
+                        txt = cell.text.strip()
+                        # If empty or not a number, skip
+                        if not txt or not txt.isdigit(): continue
+                        
+                        # Click
+                        # Use JS to be safe
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", cell)
+                        time.sleep(0.2)
+                        
+                        # Some sites imply the link is inside the cell
+                        try:
+                            link = cell.find_element(By.TAG_NAME, "a")
+                            driver.execute_script("arguments[0].click();", link)
+                        except:
+                            driver.execute_script("arguments[0].click();", cell)
+                        
+                        time.sleep(1.5) # Wait for schedule table update
+                        
+                        # Scrape
+                        scrape_current_schedule_table(driver, results, facility_name, "体育室")
+                        
+            except Exception as e:
+                logger.warning(f"Error clicking date row {r_idx}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Calendar interaction error: {e}")
 
 def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facilities=None, _status_callback=None, _progress_bar=None, _debug_placeholder=None, attempt_idx=0):
     driver = setup_driver()
@@ -240,7 +324,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                  driver.execute_script("document.querySelectorAll('header, .alert, .announcement, #sc_header_top, .navbar, .cookie-banner').forEach(e => e.remove());")
              except: pass
 
-             # Check "Civic Center"
              js_checkbox_script = """
                  var labels = document.querySelectorAll('label, span');
                  var targetLabel = null;
@@ -269,7 +352,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
              driver.execute_script(js_checkbox_script)
              time.sleep(0.5)
 
-             # Input Date
              if start_date:
                  fd = start_date.strftime("%Y-%m-%d")
                  driver.execute_script(f"""
@@ -281,8 +363,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                  """)
                  time.sleep(0.5)
 
-             # Click Search
-             if _status_callback: _status_callback("🔍 検索を実行中(JS)...")
              driver.execute_script("""
                  var btns = document.querySelectorAll('button, input[type="button"], a.btn');
                  for (var i = 0; i < btns.length; i++) {
@@ -296,7 +376,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
 
         perform_initial_search()
 
-        # Wait for Results
         try:
             if _status_callback: _status_callback("⏳ 検索結果リスト待機中...")
             wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '市民センター')]")))
@@ -328,18 +407,13 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                  try:
                      # 1. FIND HEADER FRESHLY
                      xpath_header = f"//*[contains(text(), '{search_key}')]"
-                     
-                     try:
-                         wait.until(EC.presence_of_element_located((By.XPATH, xpath_header)))
-                     except:
-                         logger.warning(f"Header for {fac} not visible.")
-                         continue
+                     try: wait.until(EC.presence_of_element_located((By.XPATH, xpath_header)))
+                     except: continue
 
                      candidates = driver.find_elements(By.XPATH, xpath_header)
                      
                      for cand in candidates:
                          if not cand.is_displayed(): continue
-                         
                          try:
                              # 2. EXPAND ACCORDION
                              room_list_toggle = cand.find_element(By.XPATH, "./following::*[contains(text(), '室場一覧') or contains(text(), 'Room List')][1]")
@@ -350,15 +424,12 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
 
                              # 3. FIND TARGET ROW & BUTTON
                              gym_row = room_list_toggle.find_element(By.XPATH, "./following::*[contains(text(), '体育室')][1]")
-                             
                              if not gym_row.is_displayed():
                                  driver.execute_script("arguments[0].click();", room_list_toggle)
                                  time.sleep(1.5)
                              
                              btn = gym_row.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '予約')][1]")
-                             
                              if btn:
-                                 # 4. CLICK BUTTON
                                  href = btn.get_attribute('href')
                                  if href and "javascript" not in href:
                                      driver.get(href)
@@ -366,23 +437,21 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                                      driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
                                      time.sleep(0.5)
                                      driver.execute_script("arguments[0].click();", btn)
-                                 
                                  is_click_success = True
                                  break 
                          except: continue
                      
-                     if not is_click_success:
-                         continue
+                     if not is_click_success: continue
 
                      # ---------------------------------------------------------
-                     # 5. DEEP SCRAPE LOOP (PAGINATION)
+                     # 5. DATE-CLICK LOOP (REPLACES PAGINATION)
                      # ---------------------------------------------------------
                      if _status_callback: _status_callback(f"  📅 カレンダー確認中: {fac}")
                      time.sleep(3) 
                      
                      switch_to_target_frame(driver, "予約状況", None)
 
-                     # Inject Date if specified (Only on first page, usually)
+                     # Inject Date
                      if start_date:
                          fd = start_date.strftime("%Y-%m-%d")
                          try:
@@ -390,23 +459,16 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                              time.sleep(1)
                          except: pass
 
-                     # Loop for weeks (e.g., 4 pages/weeks)
-                     for week_i in range(4):
-                         # Wait for Table
-                         try:
-                             WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "table")))
-                         except:
-                             break
-
-                         # Scrape
-                         scrape_current_calendar_page(driver, results, fac, "体育室")
-                         
-                         # Click Next
-                         if week_i < 3: # Don't click on last iteration
-                             clicked = click_next_week_button(driver)
-                             if not clicked:
-                                 break # No more pages
-                             time.sleep(1.5) # Wait for reload
+                     # Wait for Table
+                     try:
+                         WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "table")))
+                     except: pass
+                     
+                     # First scrape (Default view)
+                     scrape_current_schedule_table(driver, results, fac, "体育室")
+                     
+                     # Use the new Date-Click Logic
+                     process_month_calendar_clicks(driver, results, fac)
                      
                      # ---------------------------------------------------------
 
