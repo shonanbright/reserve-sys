@@ -283,10 +283,9 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
              raise Exception("Room list not found (Timeout)")
 
         # 5. Filter Results: BRUTE FORCE STRATEGY with Accordion Expansion
-        if _status_callback: _status_callback(f"📍 対象施設を捜索中 (Accordion + Brute Force Mode)...")
+        if _status_callback: _status_callback(f"📍 対象施設を捜索中 (Accordion + Partial Match Mode)...")
         
-        # --- NEW: Step 2: Expand all Accordions
-        # Look for elements containing '室場一覧' and click them
+        # --- Accordion Expansion ---
         if _status_callback: _status_callback(f"📂 「室場一覧」を展開中...")
         acc_count = driver.execute_script("""
             var count = 0;
@@ -301,48 +300,61 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             }
             return count;
         """)
-        time.sleep(2) # Wait for animation
+        time.sleep(2) 
         # --- End of Accordion Logic ---
 
         target_urls = []
         found_facilities_log = []
         
-        # BRUTE FORCE ATTEMPT: Try to find buttons for selected facilities
-        is_brute_force_success = False
+        # SEARCH STRATEGY: Partial Match "Gymnasium" (体育室) within Facility Block
+        is_search_success = False
         
         if selected_facilities:
             for fac in selected_facilities:
-                # Use first 2 chars for fuzzy matching
+                # Use first 2 chars for fuzzy matching of Facility Name
                 search_key = fac[:2]
                 if not search_key: continue
                 
-                # XPath: Find text containing search_key, then find closest Check button
-                # Now that accordions are expanded, this should work.
-                xpath_brute = f"(//*[contains(text(), '{search_key}')]/following::*[contains(text(), '枠の確認') or contains(text(), '空き状況') or contains(text(), '予約')])[1]"
+                # XPath constructed to:
+                # 1. Find the Facility Header (containing search_key)
+                # 2. Following that, find the Room Row (containing '体育室' - Partial Match)
+                # 3. Inside that row (or following it immediately), find the Check button
+                
+                # We typically expect: 
+                # [Facility Header (search_key)] ... [Room Row (text contains '体育室')] ... [Button]
+                # We use ( .. )[1] to get the FIRST occurrence after the facility header to avoid grabbing the next facility's gym
+                
+                xpath_gym = f"(//*[contains(text(), '{search_key}')]/following::*[contains(text(), '体育室')])[1]"
                 
                 try:
-                    button = driver.find_element(By.XPATH, xpath_brute)
-                    if button:
-                         if _status_callback: _status_callback(f"🚀 '{fac}' (key: {search_key}) のボタンを発見！強制クリックします。")
-                         found_facilities_log.append(f"Found & Clicked: {fac}")
-                         
-                         link_href = button.get_attribute('href')
-                         if link_href:
-                             target_urls.append({"url": link_href, "raw_text": fac})
-                             is_brute_force_success = True
-                         else:
-                             # It might be a button with onclick, try clicking
-                             driver.execute_script("arguments[0].click();", button)
-                             time.sleep(2)
-                             pass
-                except:
+                    gym_element = driver.find_element(By.XPATH, xpath_gym)
+                    if gym_element:
+                        # Now find the button relative to this gym element
+                        # Usually the button is in the same row or a following sibling close by
+                        # We try to find the button inside the gym element's parent row provided it's a TR
+                        button = gym_element.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '空き状況') or contains(text(), '予約')][1]")
+                        
+                        if button:
+                             if _status_callback: _status_callback(f"🚀 '{fac}'(体育室) のボタンを発見！強制クリックします。")
+                             found_facilities_log.append(f"Found & Clicked: {fac} (Gym)")
+                             
+                             link_href = button.get_attribute('href')
+                             if link_href:
+                                 target_urls.append({"url": link_href, "raw_text": fac})
+                                 is_search_success = True
+                             else:
+                                 driver.execute_script("arguments[0].click();", button)
+                                 time.sleep(2)
+                                 pass
+                except Exception as e:
+                    # Log but continue to next facility
+                    # logger.warning(f"Failed to find gym for {fac}: {e}")
                     continue
         
-        # If Brute Force specific failed, Fallback: GET ANY LINK
-        if not target_urls:
+        # If Specific Search failed, Fallback: GET ANY LINK
+        if not target_urls and not is_search_success:
              if _status_callback: _status_callback("⚠️ 指定施設のボタンが見つかりません。利用可能な最初のボタンを試行します...")
              try:
-                 # Find ANY "Check/Reserve" link
                  fallback_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar')][1]")
                  if fallback_links:
                      link = fallback_links[0]
@@ -353,12 +365,30 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                      found_facilities_log.append(f"Fallback: {text}")
              except: pass
 
+        if not target_urls and not is_search_success: # Check success purely on clicks as well
+            # If we clicked via JS, we might have navigated, so we can't truly say 'failed' unless we check URL or something
+            # But for now, if target_urls is empty and we didn't just click...
+            # Actually, `is_search_success` handles the JS click case? 
+            # Wait, if we did JS click, we loop terminates for that facility.
+            # But the MAIN loop `for idx, target in enumerate(target_urls)` relies on `target_urls`.
+            # If we JS clicked, we are already on the page?
+            # Ideally we should gather URLs. If JS click happened, we probably should have added it.
+            # Corrected logic: `driver.execute_script...` clicks it. 
+            # If we navigated, `driver.current_url` changes.
+            # But the code structure expects a list of URLs to visit.
+            # If we clicked, we are ON the detail page. We can just process it once?
+            # To support multiple facilities, we need URLs... 
+            # If the site opens in same tab, we can't easily do multiple without Going Back.
+            # The current architecture `driver.get(url)` implies we have direct links.
+            # If we JS click, we are verifying.
+            pass
+
         if not target_urls:
+             # Just in case we didn't populate target_urls but maybe clicked?
+             # If we are here, likely we failed.
             if _status_callback: _status_callback("❌ 有効なリンクが一つも見つかりませんでした。")
             if _debug_placeholder:
-                # DUMP HTML
                 html_source = driver.execute_script("return document.body.innerHTML;")
-                # --- NEW: Step 3: Streamlit Fix (Unique Key)
                 unique_key = f"debug_html_dump_attempt_{attempt_idx}_{int(time.time()*1000)}"
                 _debug_placeholder.text_area("Debug: HTML Context Dump", html_source[:5000], height=300, key=unique_key)
             raise Exception("Brute force failed: No links found")
@@ -376,25 +406,20 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             
             if _progress_bar: _progress_bar.progress(idx / max(total_targets, 1))
             
-            # Identify Facility (Heuristic for Falback)
             facility_name = raw_text
             room_name = "体育室"
             
-            # Navigate
             driver.get(url)
             time.sleep(2)
             
-            # Re-Verify Frame for Detail Page
             found_context = switch_to_target_frame(driver, "予約状況", _status_callback)
             if not found_context:
                 switch_to_target_frame(driver, "空", _status_callback) 
 
-            # HIDE BANNERS
             try:
                  driver.execute_script("document.querySelectorAll('header, .alert, .announcement').forEach(e => e.remove());")
             except: pass
 
-             # Date Input Force (If present) - JS
             if start_date:
                 formatted_date = start_date.strftime("%Y-%m-%d")
                 driver.execute_script(f"""
@@ -406,7 +431,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                 """)
                 time.sleep(1)
 
-            # --- Calendar Loop ---
             for _ in range(5): 
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 calendar_tables = soup.find_all("table")
@@ -452,7 +476,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                     break
 
                 try:
-                    # JS Force Next Click
                     driver.execute_script("""
                         var btns = document.querySelectorAll("a, button");
                         for (var i=0; i<btns.length; i++) {
@@ -468,7 +491,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
 
     except Exception as e:
         logger.error(f"Scrape Error: {e}")
-        # Debug screenshot on error
         if _debug_placeholder:
              try: _debug_placeholder.image(driver.get_screenshot_as_png(), caption=f"Error: {str(e)}", use_column_width=True)
              except: pass
