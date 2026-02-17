@@ -80,14 +80,14 @@ def safe_click_js(driver, element):
     except:
         return False
 
-def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status_callback, _progress_bar):
+def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status_callback, _progress_bar, _debug_placeholder):
     for attempt in range(MAX_RETRIES):
         try:
             if _status_callback: 
                 msg = f"データ取得 試行 {attempt + 1}回目..."
                 _status_callback(msg)
             
-            df = fetch_availability_deep_scan(start_date, end_date, selected_facilities, _status_callback, _progress_bar)
+            df = fetch_availability_deep_scan(start_date, end_date, selected_facilities, _status_callback, _progress_bar, _debug_placeholder)
             if not df.empty:
                 return df
             
@@ -100,7 +100,7 @@ def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status
                 time.sleep(3)
     return pd.DataFrame()
 
-def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facilities=None, _status_callback=None, _progress_bar=None):
+def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facilities=None, _status_callback=None, _progress_bar=None, _debug_placeholder=None):
     driver = setup_driver()
     wait = WebDriverWait(driver, 30) 
     results = []
@@ -118,10 +118,11 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         # 2. Check "Civic Center" Checkbox (Strict: No text input)
         if _status_callback: _status_callback("🏢 「市民センター」を選択中...")
         
-        # Clear search input if existing just in case, though instruction says just don't input.
+        # Clear search input if existing just in case
         try:
             inp = driver.find_element(By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索']")
-            inp.clear()
+            if inp.is_displayed():
+                 inp.clear()
         except: pass
         
         # Click "Civic Center"
@@ -145,15 +146,41 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             if btn.is_displayed():
                 driver.execute_script("arguments[0].click();", btn)
                 break
-        time.sleep(3)
+        
+        # --- Debug Screenshot 1: After Search Click ---
+        if _debug_placeholder:
+             time.sleep(1) # Wait a bit for click effect
+             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索ボタンクリック直後", use_column_width=True)
 
-        # Wait for Facility List
+        # Wait for Facility List (Text Detection)
         try:
-            if _status_callback: _status_callback("⏳ 施設リストの表示を待機中 (最大30秒)...")
-            wait.until(EC.presence_of_all_elements_located((By.CLASS_NAME, "panel"))) # Assuming cards are panels or similar
-        except:
-             # Fallback wait for tr or general content
-             wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "a")))
+            if _status_callback: _status_callback("⏳ 検索結果（施設リスト）の表示を待機中 (最大30秒)...")
+            
+            # Robust generic wait for text that suggests success
+            # Example: "一覧" (List), "詳細" (Detail), or any of the facility names if they appear
+            # Let's wait for body to contain some result-like text or just element presence
+            
+            # Specific wait for text appearing in the result area
+            # We wait for "市民センター" to appear in the results area (assuming list repeats "Civic Center")
+            # OR "室場" (Room) if accessible immediately
+            
+            wait.until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '確認') or contains(text(), '市民センター')]")
+                )
+            )
+            time.sleep(2) # Stabilize
+
+            # --- Debug Screenshot 2: After Results Loaded ---
+            if _debug_placeholder:
+                _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索結果表示確認", use_column_width=True)
+
+        except Exception as e:
+             # --- Debug Screenshot 3: Error State ---
+             if _debug_placeholder:
+                 _debug_placeholder.image(driver.get_screenshot_as_png(), caption="エラー: 検索結果待機タイムアウト", use_column_width=True)
+             if _status_callback: _status_callback("⚠️ 検索結果の表示待機中にタイムアウトしました。")
+             raise Exception("Room list not found (Timeout)")
 
         # 4. Filter Results: Find specific Facility Card -> "Gymnasium" Row
         if _status_callback: _status_callback(f"📍 対象施設 ({selected_facilities}) を探索中...")
@@ -161,14 +188,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         target_urls = []
         
         # Strategy: Iterate through potential facility cards (panels/containers)
-        # In ServiceNow portals, items are often in repeated containers
-        # We look for containers that have the Facility Name
-        
-        # Get all major containers
-        # Heuristic: Elements containing text matching our facilities
-        
-        # Let's find links directly since structure can vary
-        # Find all "Check Availability/Reserve" links first
         check_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar') or contains(@href, 'reserve')]")
         
         for link in check_links:
@@ -203,7 +222,14 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         target_list = list(unique_targets.values())
 
         if not target_list:
+            if _debug_placeholder:
+                _debug_placeholder.image(driver.get_screenshot_as_png(), caption="エラー: 条件合致ゼロ", use_column_width=True)
             raise Exception("条件に一致する施設（体育室）が見つかりませんでした (0件)")
+
+        if _debug_placeholder:
+            _debug_placeholder.empty() # Clear debug shots if successful to reduce clutter? Or keep last one.
+            # Keeping last one is better for "Success" confirmation
+            _debug_placeholder.success("✅ ターゲット施設を特定しました。カレンダー解析を開始します。")
 
         # 5. Detail Loop (Calendar)
         total_targets = len(target_list)
@@ -222,7 +248,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             for kf in known_facilities:
                 if kf in raw_text:
                     facility_name = kf
-                    # Simple extraction
                     room_name = "体育室" 
                     break
             
@@ -232,10 +257,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             driver.get(url)
             time.sleep(2)
             
-            # --- Important: Setting Date on Calendar Page ---
-            # If we didn't set date on search, we need to ensure we navigate to the start_date
-            # Or just rely on "Next" until we hit needed range.
-            # But usually it's better to try setting date if input exists.
+            # Date Input (Optional but recommended)
             if start_date:
                 try:
                      f_date = start_date.strftime("%Y-%m-%d")
@@ -244,7 +266,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                          if ci.is_displayed():
                              driver.execute_script(f"arguments[0].value = '{f_date}';", ci)
                              ci.send_keys(Keys.TAB)
-                             # triggering change might reload calendar
                              driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", ci)
                              time.sleep(2)
                 except: pass
@@ -331,7 +352,6 @@ def enrich_data(df):
         if not isinstance(d_str, str): return None
         try:
             clean = d_str.split('(')[0].strip()
-            # Handle MM-DD or YYYY-MM-DD
             clean = clean.replace('年', '/').replace('月', '/').replace('日', '').replace('-', '/').replace('.', '/')
             parts = [p for p in clean.split('/') if p.strip()]
             y, m, d = None, None, None
@@ -369,8 +389,8 @@ def enrich_data(df):
     df['曜日'] = df.apply(get_day, axis=1)
     return df
 
-def get_data(keyword, start_date, end_date, selected_facilities, _status, _progress):
-    df = attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status, _progress)
+def get_data(keyword, start_date, end_date, selected_facilities, _status, _progress, _debug_placeholder):
+    df = attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status, _progress, _debug_placeholder)
     return enrich_data(df)
 
 def render_schedule_card(row):
@@ -433,6 +453,11 @@ def main():
     st.sidebar.divider()
     
     if st.sidebar.button("最新情報を取得", type="primary"):
+        # Facility Guard
+        if not selected_target_facilities:
+            st.warning("対象施設を選択してください。")
+            return
+
         start_d = None
         end_d = None
         if isinstance(d_input, tuple) and len(d_input) == 2:
@@ -441,11 +466,14 @@ def main():
             st.error("期間を正しく選択してください")
             return 
 
+        # Create containers
         status_box = st.status("🚀 処理中...", expanded=True)
         p_bar = status_box.progress(0)
+        debug_area = st.expander("📸 処理状況 (Live View)", expanded=True)
+        debug_placeholder = debug_area.empty()
         
         try:
-            df = get_data("バレーボール", start_d, end_d, selected_target_facilities, status_box.write, p_bar)
+            df = get_data("バレーボール", start_d, end_d, selected_target_facilities, status_box.write, p_bar, debug_placeholder)
             st.session_state.data = df
             status_box.update(label="完了", state="complete", expanded=False)
             
