@@ -2,3 +2,4 @@ streamlit
 selenium
 pandas
 beautifulsoup4
+jpholiday

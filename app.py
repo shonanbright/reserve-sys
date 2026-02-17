@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import time
 import logging
+import datetime
+import jpholiday
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -137,7 +139,6 @@ def fetch_availability(keyword="バレーボール"):
             # 6. Iterate Weeks
             for week in range(WEEKS_TO_FETCH):
                 try:
-                    # テーブルの読み込み完了を待機: タイムアウトを短めに
                     wait.until(EC.presence_of_element_located((By.TAG_NAME, "table")))
                     soup = BeautifulSoup(driver.page_source, "html.parser")
                     
@@ -150,7 +151,9 @@ def fetch_availability(keyword="バレーボール"):
                     
                     if target_table:
                         rows = target_table.find_all("tr")
-                        headers = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
+                        try:
+                            headers = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
+                        except: headers = []
                         
                         for tr in rows[1:]:
                             cols = tr.find_all(["th", "td"])
@@ -171,6 +174,7 @@ def fetch_availability(keyword="バレーボール"):
                                 if normalized_status in ["○", "△"]:
                                     results.append({
                                         "日付": date_col,
+                                        # 曜日は後処理で正確に付与するため、ここではスクレイピングした文字をそのまま
                                         "曜日": date_col[-2] if "(" in date_col else "",
                                         "施設名": facility_name,
                                         "室場名": room_name,
@@ -207,10 +211,63 @@ def fetch_availability(keyword="バレーボール"):
     return pd.DataFrame(results)
 
 
+# --- データ後処理 (日付パース・休日判定) ---
+def enrich_data(df):
+    """
+    データフレームに日付型(dt)と休日フラグ(is_holiday)を追加する
+    """
+    if df.empty:
+        return df
+
+    current_year = datetime.datetime.now().year
+    
+    def parse_date(date_str):
+        # フォーマット例: "3/15(土)" -> datetime
+        try:
+            # カッコを除去
+            clean_str = date_str.split('(')[0]
+            month, day = map(int, clean_str.split('/'))
+            
+            # 年の推定: 現在月より小さい月なら来年、そうでなければ今年
+            # ※厳密には取得時の現在日付基準だが、簡易ロジック
+            dt = datetime.date(current_year, month, day)
+            if dt < datetime.date.today():
+                dt = datetime.date(current_year + 1, month, day)
+            return dt
+        except:
+            return None
+
+    df['dt'] = df['日付'].apply(parse_date)
+    
+    # 休日・土日判定
+    def get_day_type(dt):
+        if dt is None: return "不明"
+        if jpholiday.is_holiday(dt):
+            return "祝"
+        weekday = dt.weekday() # 0:Mon - 6:Sun
+        if weekday == 5: return "土"
+        if weekday == 6: return "日"
+        return "平日"
+
+    df['day_type'] = df['dt'].apply(get_day_type)
+    
+    # 時間帯区分
+    def get_time_category(time_str):
+        # 簡易的な分類
+        if "09:00" in time_str or "11:00" in time_str: return "午前 (9-13)"
+        if "13:00" in time_str or "15:00" in time_str: return "午後 (13-17)"
+        if "17:00" in time_str or "19:00" in time_str: return "夜間 (17-21)"
+        return "その他"
+
+    df['time_category'] = df['時間'].apply(get_time_category)
+    
+    return df
+
 # --- キャッシング ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_availability(keyword):
-    return fetch_availability(keyword=keyword)
+    df = fetch_availability(keyword=keyword)
+    return enrich_data(df)
 
 # --- UI コンポーネント ---
 def render_schedule_card(row):
@@ -219,23 +276,30 @@ def render_schedule_card(row):
     room = row.get('室場名', '')
     date_str = row.get('日付', '')
     time_slot = row.get('時間', '')
+    day_type = row.get('day_type', '')
     
+    # バッジの色
+    badge_color = "gray"
+    if day_type == "土": badge_color = "blue"
+    elif day_type == "日": badge_color = "red"
+    elif day_type == "祝": badge_color = "red"
+
     if status == "○":
         delta_color = "normal"
-        status_label = "空きあり"
+        status_label = "空"
     elif status == "△":
         delta_color = "off"
-        status_label = "残りわずか"
+        status_label = "少"
     else:
         delta_color = "inverse"
-        status_label = "空きなし"
+        status_label = "満"
 
     with st.container(border=True):
-        col1, col2 = st.columns([1, 2])
+        col1, col2 = st.columns([1, 3])
         with col1:
             st.metric(label="状況", value=status, delta=status_label, delta_color=delta_color)
         with col2:
-            st.markdown(f"**{date_str}**")
+            st.markdown(f"**{date_str}** :{badge_color}[{day_type}]")
             st.text(f"{time_slot}")
             st.caption(f"{facility} {room}")
 
@@ -274,26 +338,61 @@ def main():
         df = st.session_state.data
         
         with filter_container:
-            st.subheader("絞り込み")
-            facilities = sorted(df['施設名'].unique().tolist()) if '施設名' in df.columns else []
-            selected_facilities = st.multiselect("施設", facilities, default=facilities)
+            st.subheader("条件絞り込み")
             
-            times = sorted(df['時間'].unique().tolist()) if '時間' in df.columns else []
-            selected_times = st.multiselect("時間帯", times, default=times)
+            # 曜日フィルタ
+            st.markdown("**対象の曜日**")
+            cols_day = st.columns(3)
+            use_sat = cols_day[0].checkbox("土曜", value=True)
+            use_sun = cols_day[1].checkbox("日曜", value=True)
+            use_hol = cols_day[2].checkbox("祝日", value=True)
+            use_weekday = st.checkbox("平日も含める", value=False)
+            
+            target_days = []
+            if use_sat: target_days.append("土")
+            if use_sun: target_days.append("日")
+            if use_hol: target_days.append("祝")
+            if use_weekday: target_days.append("平日")
 
+            # 時間帯フィルタ
+            st.markdown("**時間帯**")
+            all_time_cats = ["午前 (9-13)", "午後 (13-17)", "夜間 (17-21)", "その他"]
+            selected_time_cats = st.multiselect("ラベル選択", all_time_cats, default=all_time_cats)
+
+            # 施設フィルタ
+            st.markdown("**施設**")
+            if '施設名' in df.columns:
+                facilities = sorted(df['施設名'].unique().tolist())
+                selected_facilities = st.multiselect("施設名", facilities, default=facilities)
+            else:
+                selected_facilities = []
+
+            # フィルタリング適用
             mask = pd.Series(True, index=df.index)
-            if selected_facilities: mask &= df['施設名'].isin(selected_facilities)
-            if selected_times: mask &= df['時間'].isin(selected_times)
+            
+            # 曜日マッチング
+            mask &= df['day_type'].isin(target_days)
+            
+            # 時間マッチング
+            mask &= df['time_category'].isin(selected_time_cats)
+            
+            # 施設マッチング
+            if selected_facilities:
+                mask &= df['施設名'].isin(selected_facilities)
+                
             filtered_df = df[mask]
 
-        st.write(f"**検索結果: {len(filtered_df)} 件**")
+        st.write(f"**検索結果: {len(filtered_df)} 件** (全 {len(df)} 件中)")
         
         try:
-            filtered_df = filtered_df.sort_values(by=["日付", "時間"])
+            filtered_df = filtered_df.sort_values(by=["dt", "時間"])
         except: pass
 
-        for idx, row in filtered_df.iterrows():
-            render_schedule_card(row)
+        if filtered_df.empty:
+            st.info("条件に一致する空き状況はありません。")
+        else:
+            for idx, row in filtered_df.iterrows():
+                render_schedule_card(row)
     
     elif 'data' not in st.session_state:
         st.info("👈 サイドバーの「最新情報を取得」ボタンを押してください。")
