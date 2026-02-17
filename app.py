@@ -76,11 +76,12 @@ def safe_click_js(driver, element):
     except:
         return False
 
-def fetch_availability(keyword="バレーボール"):
+def fetch_availability(keyword="バレーボール", _status_callback=None, _progress_bar=None):
     driver = setup_driver()
-    # サイトが重い場合に備えて待機時間を30秒に延長
     wait = WebDriverWait(driver, 30) 
     results = []
+
+    if _status_callback: _status_callback("藤沢市予約サイトへアクセス中...")
 
     try:
         # 1. Access
@@ -88,6 +89,7 @@ def fetch_availability(keyword="バレーボール"):
         time.sleep(3)
 
         # 2. Search
+        if _status_callback: _status_callback(f"「{keyword}」で施設を検索中...")
         try:
             search_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索']")))
             search_input.clear()
@@ -99,6 +101,7 @@ def fetch_availability(keyword="バレーボール"):
             return pd.DataFrame()
 
         # 3. Expand Facilities
+        if _status_callback: _status_callback("施設リストを展開中...")
         expand_buttons = driver.find_elements(By.CSS_SELECTOR, "button.expand-icon, i.fa-caret-right, span.icon-caret-right")
         for btn in expand_buttons:
             safe_click_js(driver, btn)
@@ -107,7 +110,6 @@ def fetch_availability(keyword="バレーボール"):
         # 4. Get Room Links
         room_links_elements = driver.find_elements(By.CSS_SELECTOR, "a.room-link, td.room-name a")
         if not room_links_elements:
-             # フォールバック検索
              room_links_elements = [
                  elem for elem in driver.find_elements(By.TAG_NAME, "a") 
                  if "空き" in elem.text or "予約" in elem.text or "calendar" in (elem.get_attribute("href") or "")
@@ -123,11 +125,12 @@ def fetch_availability(keyword="バレーボール"):
                 pass
         
         if not room_urls:
-            # リンクが見つからない場合は現在のページを対象とする（検索結果一覧などでカレンダーが表示されている場合）
             room_urls = [("検索結果一覧", driver.current_url)]
 
         # 5. Iterate Rooms
-        for room_name, url in room_urls:
+        total_rooms = len(room_urls)
+        
+        for r_idx, (room_name, url) in enumerate(room_urls):
             if url != driver.current_url:
                 driver.get(url)
                 time.sleep(3)
@@ -138,9 +141,24 @@ def fetch_availability(keyword="バレーボール"):
             except:
                 facility_name = "不明な施設"
 
+            if _status_callback: _status_callback(f"解析中: {facility_name} - {room_name}")
+
             # 6. Iterate Weeks
             for week in range(WEEKS_TO_FETCH):
+                # Progress update
+                if _progress_bar:
+                    # Overall progress calculation (rough estimate)
+                    # rooms: r_idx / total_rooms
+                    # weeks: week / WEEKS_TO_FETCH
+                    # simple weighted progress
+                    room_progress = r_idx / total_rooms
+                    week_progress = (week / WEEKS_TO_FETCH) / total_rooms
+                    current_progress = min(room_progress + week_progress, 0.95)
+                    _progress_bar.progress(current_progress)
+
+                # Fetch Table
                 try:
+                    # テーブルが表示されるまで待つ
                     wait.until(EC.presence_of_element_located((By.TAG_NAME, "table")))
                     soup = BeautifulSoup(driver.page_source, "html.parser")
                     
@@ -199,11 +217,16 @@ def fetch_availability(keyword="バレーボール"):
                             break 
                             
                 except Exception as e:
-                    logger.warning(f"Error reading table: {e}")
+                    # テーブルがない、または次へボタンがない場合などはログして次へ
+                    logger.debug(f"Week loop error or end: {e}")
                     break
+        
+        if _progress_bar: _progress_bar.progress(1.0)
+        if _status_callback: _status_callback("全データの取得が完了しました！")
 
     except Exception as e:
         logger.error(f"Global Error: {e}")
+        if _status_callback: _status_callback(f"エラーが発生しました: {e}")
     finally:
         driver.quit()
 
@@ -259,8 +282,10 @@ def enrich_data(df):
     return df
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_cached_availability(keyword):
-    df = fetch_availability(keyword=keyword)
+def get_cached_availability(keyword, _status_callback=None, _progress_bar=None):
+    # キャッシュ時はコールバックが呼ばれない可能性があるが、データがあれば即座に返るため許容
+    # 初回実行時のみUI更新が走る
+    df = fetch_availability(keyword, _status_callback, _progress_bar)
     return enrich_data(df)
 
 def render_schedule_card(row):
@@ -330,24 +355,34 @@ def main():
 
     if st.sidebar.button("最新情報を取得", type="primary"):
         if isinstance(date_range, tuple) and len(date_range) == 2:
-            st.info("藤沢市予約システムに接続しています。しばらくお待ちください（約30秒〜1分）...")
             st.session_state.data = pd.DataFrame()
-            status_text = st.status("データ取得中...", expanded=True)
+            
+            # コンテナとステータス表示の準備
+            status_container = st.status("🚀 処理を開始します...", expanded=True)
+            progress_bar = status_container.progress(0, text="準備中...")
+            
+            def update_status(msg):
+                status_container.write(msg)
+                
+            start_time = time.time()
             
             try:
-                # バレーボールで検索
-                raw_data = get_cached_availability("バレーボール")
+                # Scrape
+                raw_data = get_cached_availability("バレーボール", _status_callback=update_status, _progress_bar=progress_bar)
+                
+                elapsed_time = time.time() - start_time
                 
                 if not raw_data.empty:
                     st.session_state.data = raw_data
-                    status_text.update(label="取得完了！", state="complete", expanded=False)
-                    st.success("最新のデータを取得しました！")
+                    status_container.update(label=f"完了！ ({elapsed_time:.1f}秒)", state="complete", expanded=False)
+                    st.success(f"最新データを取得しました！ (所要時間: {elapsed_time:.1f}秒)")
                 else:
-                    status_text.update(label="データなし", state="error")
-                    st.warning("システムから空き状況を取得できませんでした（または空きがありません）。")
+                    status_container.update(label="データなし", state="error")
+                    st.warning("空き状況は見つかりませんでした（またはサイト混雑等で取得失敗）。")
+                    
             except Exception as e:
-                status_text.update(label="エラー", state="error")
-                st.error(f"取得に失敗しました: {e}")
+                status_container.update(label="エラー発生", state="error")
+                st.error(f"システムエラー: {e}")
         else:
             st.error("開始日と終了日の両方を選択してください。")
 
@@ -378,7 +413,7 @@ def main():
         filtered_count = len(filtered_df)
 
         if filtered_count > 0:
-            st.success(f"{filtered_count} 件の空きが見つかりました！（全{total_count}件中）")
+            st.success(f"✨ **{filtered_count}** 件の空きが見つかりました！（全{total_count}件中）")
         else:
             st.warning(f"条件に一致する空きはありませんでした。（全{total_count}件取得）")
             with st.expander("フィルタ前のデータを確認"):
