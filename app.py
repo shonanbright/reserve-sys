@@ -265,7 +265,7 @@ def fetch_availability_core(keyword="バレーボール", start_date=None, _stat
         driver.quit()
 
     if not results:
-        return pd.DataFrame(columns=['日付', '施設名', '時間', '状況'])
+        return pd.DataFrame(columns=['日付', '施設名', '時間', '状況', '曜日', 'dt'])
     
     return pd.DataFrame(results)
 
@@ -279,33 +279,56 @@ def enrich_data(df):
 
     def parse_date(d_str):
         if not isinstance(d_str, str): return None
-        # Clean string: "2026-03-01", "3/1(土)"
         try:
+            # Common formats: "2026-03-01", "3/1(土)", "03/01", "2026/3/1"
             clean = d_str.split('(')[0].strip()
-            # Replace hyphens/dots/kanji
+            # Normalize separators
             clean = clean.replace('年', '/').replace('月', '/').replace('日', '').replace('-', '/').replace('.', '/')
-            parts = clean.split('/')
+            parts = [p for p in clean.split('/') if p.strip()] # remove empty
             
-            if len(parts) == 2: # MM/DD
+            y, m, d = None, None, None
+            
+            if len(parts) == 3:
+                # YYYY/MM/DD or MM/DD/YYYY
+                if len(parts[0]) == 4:
+                    y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+                elif len(parts[2]) == 4:
+                    y, m, d = int(parts[2]), int(parts[0]), int(parts[1])
+            elif len(parts) == 2:
+                # MM/DD
                 m, d = int(parts[0]), int(parts[1])
-                dt = datetime.date(CURRENT_YEAR, m, d)
-                if dt < TODAY - datetime.timedelta(days=90): 
-                    dt = datetime.date(CURRENT_YEAR + 1, m, d)
-                return dt
-            elif len(parts) == 3: # YYYY/MM/DD
-                y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+                y = CURRENT_YEAR
+                # If date is very old (e.g. searching for Jan in Dec), assume next year
+                temp_dt = datetime.date(y, m, d)
+                if temp_dt < TODAY - datetime.timedelta(days=90):
+                    y += 1
+            
+            if y and m and d:
                 return datetime.date(y, m, d)
+                
         except: return None
         return None
 
     df['dt'] = df['日付'].apply(parse_date)
-    
-    def get_day(dt):
-        if dt is None: return "不明"
-        if jpholiday.is_holiday(dt): return "祝"
-        return ["月","火","水","木","金","土","日"][dt.weekday()]
 
-    df['曜日'] = df['dt'].apply(get_day)
+    def get_day(row):
+        dt = row['dt']
+        d_str = str(row.get('日付', ''))
+        
+        # 1. Try from datetime object
+        if dt:
+            if jpholiday.is_holiday(dt): return "祝"
+            return ["月","火","水","木","金","土","日"][dt.weekday()]
+            
+        # 2. Try from string (e.g. "3/1(土)")
+        # Look for (土) or （土）
+        for w in ["月","火","水","木","金","土","日"]:
+            if f"({w})" in d_str or f"（{w}）" in d_str:
+                return w
+                
+        return "不明"
+
+    df['曜日'] = df.apply(get_day, axis=1)
     return df
 
 @st.cache_data(ttl=600)
@@ -380,9 +403,18 @@ def main():
             status_box.update(label="完了", state="complete", expanded=False)
             
             if not df.empty:
-                # Filtering
-                mask = (df['dt'] >= start_d) & (df['dt'] <= end_d)
+                # Time Filter
+                mask = pd.Series(True, index=df.index)
                 
+                # Check valid dates
+                if 'dt' in df.columns:
+                     # Keep rows even if dt is None? Maybe yes to debug
+                     # But for date range filter we need dt
+                     date_mask = (df['dt'] >= start_d) & (df['dt'] <= end_d)
+                     # Handle NaT/None
+                     date_mask = date_mask.fillna(False)
+                     mask &= date_mask
+
                 if selected_times:
                     time_mask = pd.Series(False, index=df.index)
                     for t in selected_times:
@@ -398,17 +430,17 @@ def main():
                         final_df = final_df.sort_values(by=['dt', '時間', '施設名'])
                     except: pass
 
-                    # Table Display
                     with st.expander("全体の表を見る"):
                         st.table(final_df[['日付', '曜日', '施設名', '時間', '状況']])
                     
-                    # Card Display
                     st.subheader("空き状況カード")
                     for _, row in final_df.iterrows():
                         render_schedule_card(row)
                         
                 else:
                     st.warning("条件に合う空きは見つかりませんでした。")
+                    with st.expander("詳細デバッグ (フィルタ前データ)"):
+                         st.dataframe(df)
             else:
                 st.error("データ取得に失敗しました（または空きがありません）。")
                 
