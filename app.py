@@ -121,69 +121,54 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
              time.sleep(0.5)
         except: pass
 
-        # 2. Check "Civic Center" Checkbox (Strict: No text input)
-        if _status_callback: _status_callback("🏢 「市民センター」を選択中...")
+        # 2. Check "Civic Center" Checkbox using XPath Text
+        if _status_callback: _status_callback("🏢 「市民センター」を選択中(XPath text)...")
         
-        # Clear search input strict
         try:
-            inp = driver.find_element(By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索']")
-            if inp.is_displayed():
-                 driver.execute_script("arguments[0].value = '';", inp)
-        except: pass
-        
-        # Click "Civic Center" - Force JS Check
-        try:
-            labels = driver.find_elements(By.XPATH, "//label[contains(text(), '市民センター')] | //span[contains(text(), '市民センター')]")
-            for lbl in labels:
-                if lbl.is_displayed():
-                    # Attempt to find the checkbox input associated with this label
-                    try:
-                        # Try finding previous sibling input or input inside
-                        checkbox = lbl.find_element(By.XPATH, "./preceding-sibling::input[@type='checkbox'] | ./descendant::input[@type='checkbox']")
-                        if checkbox:
-                             driver.execute_script("arguments[0].checked = true; arguments[0].dispatchEvent(new Event('change'));", checkbox)
-                        else:
-                             # Fallback to verify if label click works
-                             safe_click_js(driver, lbl)
-                    except:
-                        safe_click_js(driver, lbl)
-                    
-                    time.sleep(1)
-                    break
+            # Find label containing '市民センター'
+            civic_label = driver.find_element(By.XPATH, "//label[contains(., '市民センター')] | //span[contains(., '市民センター')]")
+            if civic_label.is_displayed():
+                safe_click_js(driver, civic_label)
+                time.sleep(1)
         except Exception as e:
             logger.warning(f"Checkbox selection warning: {e}")
 
-        # 3. Input Date (Force JS Injection)
+        # 3. Input Date using XPath generic label following sibling
         if start_date:
             formatted_date = start_date.strftime("%Y-%m-%d")
-            if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中(JS強制)...")
+            if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中(XPath)...")
             
-            inputs_to_try = driver.find_elements(By.CSS_SELECTOR, "input[type='date'], input.datepicker, input[name*='date'], input[id*='date']")
-            for inp in inputs_to_try:
-                try:
-                    if inp.is_displayed():
-                        # JS Force Value
-                        driver.execute_script(f"arguments[0].value = '{formatted_date}';", inp)
-                        # Fire change event
-                        driver.execute_script("arguments[0].dispatchEvent(new Event('change')); arguments[0].dispatchEvent(new Event('input'));", inp)
-                        time.sleep(0.5)
-                        inp.send_keys(Keys.TAB)
-                        time.sleep(1)
-                except: pass
+            try:
+                # Find input following "利用日" label
+                date_input = driver.find_element(By.XPATH, "//label[contains(., '利用日')]/following::input[1]")
+                if date_input.is_displayed():
+                    # Force value via JS
+                    driver.execute_script(f"arguments[0].value = '{formatted_date}';", date_input)
+                    time.sleep(0.5)
+                    # Trigger events
+                    driver.execute_script("arguments[0].dispatchEvent(new Event('change')); arguments[0].dispatchEvent(new Event('input'));", date_input)
+                    date_input.send_keys(Keys.TAB)
+                    time.sleep(1)
+            except Exception as e:
+                logger.warning(f"Date input warning: {e}")
 
-        # 4. Click Search Button immediately (JS Force)
-        if _status_callback: _status_callback("🔍 検索を実行中(JS強制)...")
-        
-        search_btns = driver.find_elements(By.XPATH, "//button[contains(text(), '検索')] | //input[@type='button' and @value='検索'] | //a[contains(text(), '検索') and contains(@class, 'btn')]")
-        for btn in search_btns:
-            if btn.is_displayed():
-                driver.execute_script("arguments[0].click();", btn)
-                break
-        
-        # --- Debug Screenshot 1: After Search Click ---
+        # 4. Debug Screenshot BEFORE Search
         if _debug_placeholder:
-             time.sleep(2) 
-             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索ボタンクリック直後", use_column_width=True)
+             if _status_callback: _status_callback("📸 検索実行前の状態確認...")
+             time.sleep(1)
+             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索ボタンクリック前（条件確認）", use_column_width=True)
+
+        # 5. Click Search Button using XPath text
+        if _status_callback: _status_callback("🔍 検索を実行中(XPath)...")
+        
+        try:
+            # Target button with text '検索'
+            search_btn = driver.find_element(By.XPATH, "//button[contains(., '検索')] | //input[@type='button' and @value='検索'] | //a[contains(., '検索') and contains(@class, 'btn')]")
+            if search_btn.is_displayed():
+                safe_click_js(driver, search_btn)
+                time.sleep(2)
+        except Exception as e:
+             logger.warning(f"Search button click warning: {e}")
 
         # Wait for Facility List (Text Detection)
         try:
@@ -196,12 +181,12 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             )
             time.sleep(2) 
 
-            # --- Debug Screenshot 2: After Results Loaded ---
+            # --- Debug Screenshot: After Results Loaded ---
             if _debug_placeholder:
                 _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索結果表示確認", use_column_width=True)
 
         except Exception as e:
-             # --- Debug Screenshot 3: Error State ---
+             # --- Debug Screenshot: Error State ---
              if _debug_placeholder:
                  _debug_placeholder.image(driver.get_screenshot_as_png(), caption="エラー: 検索結果待機タイムアウト", use_column_width=True)
              if _status_callback: _status_callback("⚠️ 検索結果の表示待機中にタイムアウトしました。")
@@ -247,8 +232,9 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         target_list = list(unique_targets.values())
 
         if not target_list:
-            if _debug_placeholder:
-                _debug_placeholder.image(driver.get_screenshot_as_png(), caption="エラー: 条件合致ゼロ", use_column_width=True)
+            if _status_callback: _status_callback("⚠️ 条件に一致する施設が見つかりません。")
+            # Don't throw immediately inside retry loop to observe visual
+            # But we must raise to trigger retry logic
             raise Exception("条件に一致する施設（体育室）が見つかりませんでした (0件)")
 
         if _debug_placeholder:
@@ -281,7 +267,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             driver.get(url)
             time.sleep(2)
             
-            # HIDE BANNERS (Again for detail page)
+            # HIDE BANNERS
             try:
                  driver.execute_script("document.querySelectorAll('.alert, .notification, [class*=\"banner\"]').forEach(el => el.style.display = 'none');")
             except: pass
@@ -290,13 +276,13 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             if start_date:
                 try:
                      f_date = start_date.strftime("%Y-%m-%d")
-                     c_inp = driver.find_elements(By.CSS_SELECTOR, "input[type='date'], input.datepicker")
-                     for ci in c_inp:
+                     # Try generic XPath for detail page too just in case
+                     inp = driver.find_elements(By.XPATH, "//input[@type='date'] | //input[contains(@class, 'datepicker')]")
+                     for ci in inp:
                          if ci.is_displayed():
                              driver.execute_script(f"arguments[0].value = '{f_date}';", ci)
                              driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", ci)
-                             time.sleep(1)
-                             ci.send_keys(Keys.TAB) # Sometimes needed to trigger reload
+                             ci.send_keys(Keys.TAB)
                              time.sleep(1)
                 except: pass
 
