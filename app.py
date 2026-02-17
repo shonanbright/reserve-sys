@@ -78,7 +78,8 @@ def safe_click_js(driver, element):
 
 def fetch_availability(keyword="バレーボール"):
     driver = setup_driver()
-    wait = WebDriverWait(driver, 15)
+    # サイトが重い場合に備えて待機時間を30秒に延長
+    wait = WebDriverWait(driver, 30) 
     results = []
 
     try:
@@ -93,7 +94,8 @@ def fetch_availability(keyword="バレーボール"):
             search_input.send_keys(keyword)
             search_input.submit()
             time.sleep(5)
-        except:
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
             return pd.DataFrame()
 
         # 3. Expand Facilities
@@ -105,6 +107,7 @@ def fetch_availability(keyword="バレーボール"):
         # 4. Get Room Links
         room_links_elements = driver.find_elements(By.CSS_SELECTOR, "a.room-link, td.room-name a")
         if not room_links_elements:
+             # フォールバック検索
              room_links_elements = [
                  elem for elem in driver.find_elements(By.TAG_NAME, "a") 
                  if "空き" in elem.text or "予約" in elem.text or "calendar" in (elem.get_attribute("href") or "")
@@ -120,6 +123,7 @@ def fetch_availability(keyword="バレーボール"):
                 pass
         
         if not room_urls:
+            # リンクが見つからない場合は現在のページを対象とする（検索結果一覧などでカレンダーが表示されている場合）
             room_urls = [("検索結果一覧", driver.current_url)]
 
         # 5. Iterate Rooms
@@ -194,11 +198,12 @@ def fetch_availability(keyword="バレーボール"):
                         if not clicked:
                             break 
                             
-                except:
+                except Exception as e:
+                    logger.warning(f"Error reading table: {e}")
                     break
 
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Global Error: {e}")
     finally:
         driver.quit()
 
@@ -209,7 +214,6 @@ def fetch_availability(keyword="バレーボール"):
 
 
 # --- データ後処理 (日付パース・休日判定) ---
-# 現在年をキャッシュして計算コスト削減
 CURRENT_YEAR = datetime.datetime.now().year
 TODAY = datetime.date.today()
 
@@ -223,11 +227,7 @@ def enrich_data(df):
             clean_str = date_str.split('(')[0]
             month, day = map(int, clean_str.split('/'))
             
-            # 年またぎの推定
-            # データが過去の日付（例: 今日が12月でデータが1月）なら来年
-            # 今日が1月でデータが12月なら今年（前年データは通常出ない）
-            # 簡易ロジック: 月が現在月より小さく、かつ差が大きい場合は来年とみなす、等
-            # ここでは「日付が今日より前なら来年」とするシンプルロジックを採用
+            # 年またぎロジック
             dt = datetime.date(CURRENT_YEAR, month, day)
             if dt < TODAY:
                 dt = datetime.date(CURRENT_YEAR + 1, month, day)
@@ -238,7 +238,6 @@ def enrich_data(df):
     df['dt'] = df['日付'].apply(parse_date)
     
     # 曜日判定 (祝日優先)
-    # ユーザー選択肢: ["月", "火", "水", "木", "金", "土", "日", "祝"]
     def get_day_label(dt):
         if dt is None: return "不明"
         if jpholiday.is_holiday(dt):
@@ -249,7 +248,6 @@ def enrich_data(df):
     df['day_label'] = df['dt'].apply(get_day_label)
     
     # 時間帯区分
-    # ユーザー選択肢: ["午前", "午後", "夜間"]
     def get_slot_label(time_str):
         if "09:00" in time_str or "11:00" in time_str: return "午前"
         if "13:00" in time_str or "15:00" in time_str: return "午後"
@@ -307,7 +305,7 @@ def main():
     # 1. 期間設定
     default_end = TODAY + datetime.timedelta(days=14)
     min_date = TODAY
-    max_date = TODAY + datetime.timedelta(days=90) # 少し長めに許可
+    max_date = TODAY + datetime.timedelta(days=120) 
     
     date_range = st.sidebar.date_input(
         "検索期間",
@@ -332,23 +330,24 @@ def main():
 
     if st.sidebar.button("最新情報を取得", type="primary"):
         if isinstance(date_range, tuple) and len(date_range) == 2:
-            st.info(f"{date_range[0]} ～ {date_range[1]} の空き状況を確認中...")
-            
+            st.info("藤沢市予約システムに接続しています。しばらくお待ちください（約30秒〜1分）...")
             st.session_state.data = pd.DataFrame()
-            status_text = st.status("データ取得中... (数分かかります)", expanded=True)
+            status_text = st.status("データ取得中...", expanded=True)
+            
             try:
-                # スクレイピング実行
+                # バレーボールで検索
                 raw_data = get_cached_availability("バレーボール")
                 
                 if not raw_data.empty:
                     st.session_state.data = raw_data
-                    status_text.update(label="データ取得完了！ フィルタリングします...", state="complete", expanded=False)
+                    status_text.update(label="取得完了！", state="complete", expanded=False)
+                    st.success("最新のデータを取得しました！")
                 else:
                     status_text.update(label="データなし", state="error")
-                    st.warning("システムから空き状況を取得できませんでした。")
+                    st.warning("システムから空き状況を取得できませんでした（または空きがありません）。")
             except Exception as e:
-                status_text.update(label="エラー発生", state="error")
-                st.error(f"Error: {e}")
+                status_text.update(label="エラー", state="error")
+                st.error(f"取得に失敗しました: {e}")
         else:
             st.error("開始日と終了日の両方を選択してください。")
 
@@ -362,36 +361,29 @@ def main():
         df = st.session_state.data
         total_count = len(df)
         
-        # フィルタリング処理用ロジック
+        # フィルタリング
         mask = pd.Series(True, index=df.index)
         
-        # 1. 日付範囲
         if isinstance(date_range, tuple) and len(date_range) == 2:
             start_d, end_d = date_range
-            # dtカラム(date型)で比較
             mask &= (df['dt'] >= start_d) & (df['dt'] <= end_d)
             
-        # 2. 曜日
         if selected_days:
             mask &= df['day_label'].isin(selected_days)
             
-        # 3. 時間帯
         if selected_slots:
             mask &= df['slot_label'].isin(selected_slots)
         
         filtered_df = df[mask]
         filtered_count = len(filtered_df)
 
-        # デバッグ・ステータス表示
         if filtered_count > 0:
             st.success(f"{filtered_count} 件の空きが見つかりました！（全{total_count}件中）")
         else:
-            st.warning(f"条件に一致する空きはありませんでした。（全{total_count}件取得しましたが、フィルタで0件になりました）")
-            # 親切機能: どういうデータが取れていたかチラ見せ（デバッグ用）
-            with st.expander("フィルタ前の生データを確認する"):
-                st.dataframe(df[['日付', '曜日', '施設名', '時間', '状況', 'day_label', 'slot_label']])
+            st.warning(f"条件に一致する空きはありませんでした。（全{total_count}件取得）")
+            with st.expander("フィルタ前のデータを確認"):
+                st.dataframe(df[['日付', '曜日', '施設名', '時間', '状況']])
 
-        # 結果表示
         try:
             filtered_df = filtered_df.sort_values(by=["dt", "時間"])
         except: pass
