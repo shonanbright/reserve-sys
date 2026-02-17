@@ -282,110 +282,154 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
              if _status_callback: _status_callback("⚠️ 検索結果の表示待機中にタイムアウトしました。")
              raise Exception("Room list not found (Timeout)")
 
-        # 5. Filter Results: BRUTE FORCE STRATEGY with Accordion Expansion
-        if _status_callback: _status_callback(f"📍 対象施設を捜索中 (Accordion + Partial Match Mode)...")
+        # 5. Filter Results: SCOPED INTERACTION
+        if _status_callback: _status_callback(f"📍 対象施設を捜索中 (Scoped Mode)...")
         
-        # --- Accordion Expansion ---
-        if _status_callback: _status_callback(f"📂 「室場一覧」を展開中...")
-        acc_count = driver.execute_script("""
-            var count = 0;
-            var els = document.querySelectorAll('*');
-            for(var i=0; i<els.length; i++){
-                if(els[i].innerText && (els[i].innerText.includes('室場一覧') || els[i].innerText.includes('Room List')) && els[i].tagName !== 'SCRIPT'){
-                    try {
-                        els[i].click();
-                        count++;
-                    } catch(e) {}
-                }
-            }
-            return count;
-        """)
-        time.sleep(2) 
-        # --- End of Accordion Logic ---
-
         target_urls = []
         found_facilities_log = []
-        
-        # SEARCH STRATEGY: Partial Match "Gymnasium" (体育室) within Facility Block
         is_search_success = False
         
         if selected_facilities:
+            # First, find ALL potential facility containers.
+            # We assume a structure where facility name is in a header/label, and the "Room List" is nearby.
+            # Strategy: Find the facility name element, then define that 'area' as the scope.
+            
             for fac in selected_facilities:
-                # Use first 2 chars for fuzzy matching of Facility Name
                 search_key = fac[:2]
                 if not search_key: continue
                 
-                # XPath constructed to:
-                # 1. Find the Facility Header (containing search_key)
-                # 2. Following that, find the Room Row (containing '体育室' - Partial Match)
-                # 3. Inside that row (or following it immediately), find the Check button
-                
-                # We typically expect: 
-                # [Facility Header (search_key)] ... [Room Row (text contains '体育室')] ... [Button]
-                # We use ( .. )[1] to get the FIRST occurrence after the facility header to avoid grabbing the next facility's gym
-                
-                xpath_gym = f"(//*[contains(text(), '{search_key}')]/following::*[contains(text(), '体育室')])[1]"
-                
                 try:
-                    gym_element = driver.find_element(By.XPATH, xpath_gym)
-                    if gym_element:
-                        # Now find the button relative to this gym element
-                        # Usually the button is in the same row or a following sibling close by
-                        # We try to find the button inside the gym element's parent row provided it's a TR
-                        button = gym_element.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '空き状況') or contains(text(), '予約')][1]")
-                        
-                        if button:
-                             if _status_callback: _status_callback(f"🚀 '{fac}'(体育室) のボタンを発見！強制クリックします。")
-                             found_facilities_log.append(f"Found & Clicked: {fac} (Gym)")
+                    # 1. SCOPE IDENTIFICATION
+                    # Find facility header/label
+                    # We look for something that contains the facility name.
+                    # This finds ALL matches, we need to iterate to ensure we get the right one that HAS a Room List.
+                    
+                    if _status_callback: _status_callback(f"🔎 施設 '{fac}' (key:{search_key}) の親コンテナを特定中...")
+                    
+                    facility_headers = driver.find_elements(By.XPATH, f"//*[contains(text(), '{search_key}')]")
+                    
+                    target_container = None
+                    for header in facility_headers:
+                        # Heuristic: The header usually is inside a panel-heading or similar.
+                        # We try to go up to a container.
+                        try:
+                            # Try to find a common ancestor that contains "室場"
+                            # Or just work relative to the header.
+                            # Let's try to find "Room List" relative to this header.
+                            # axis: following
+                            pass
+                        except: continue
+
+                    # Better Scoped Strategy:
+                    # Iterate through match, define scope as the block between this header and the next one? 
+                    # Easier: Use 'following' but limit search?
+                    # No, Selenium 'following' goes to end of doc. 
+                    # We need to find the container.
+                    # Assumption: The layout is cards/panels.
+                    # Let's try to find an ancestor 'div' or 'tr' that contains the header.
+                    
+                    # Implementation:
+                    # Find matching header. Get its parent/ancestor.
+                    # Check if that ancestor has "Room List" or "Gymnasium".
+                    
+                    # Let's try finding the header, then finding the NEAREST "Room List" toggle.
+                    # xpath: (//header[contains(., scan_key)]/following::*[contains(., '室場一覧')])[1]
+                    
+                    xpath_header = f"(//*[contains(text(), '{search_key}') and (contains(text(), '市民センター') or contains(text(), '公民館'))])"
+                    # If fuzzy logic is tricky, just use search_key
+                    xpath_header = f"//*[contains(text(), '{search_key}')]"
+                    
+                    candidates = driver.find_elements(By.XPATH, xpath_header)
+                    
+                    for cand in candidates:
+                         # Filter out tiny elements or script garbage
+                         if not cand.is_displayed(): continue
+                         
+                         # Check if this candidate is actually a Facility Header
+                         # (Check context)
+                         # We'll assume the correct one will have "Room List" nearby.
+                         
+                         # 2. ACCORDION EXPANSION (SCOPED)
+                         # Look for 'Room List' relative to this candidate
+                         try:
+                             # 'following::' selects everything after. We need 'descendant' or near sibling.
+                             # If card structure: Header is sibling of Body.
+                             # Body contains Room List.
                              
-                             link_href = button.get_attribute('href')
-                             if link_href:
-                                 target_urls.append({"url": link_href, "raw_text": fac})
-                                 is_search_success = True
-                             else:
-                                 driver.execute_script("arguments[0].click();", button)
-                                 time.sleep(2)
-                                 pass
+                             # Let's try to find the "Room List" button that is closest following this header.
+                             room_list_toggle = cand.find_element(By.XPATH, "./following::*[contains(text(), '室場一覧') or contains(text(), 'Room List')][1]")
+                             
+                             # Scroll to it
+                             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", room_list_toggle)
+                             time.sleep(0.5)
+                             
+                             # Expand
+                             driver.execute_script("arguments[0].click();", room_list_toggle)
+                             time.sleep(1) # Wait for animation
+                             
+                             # 3. FIND ROOM (SCOPED)
+                             # Now look for Gymnasium specifically relative to this toggle (or the container it opened)
+                             # Since we expanded it, the gymnasium row should be visible or in DOM following the toggle.
+                             
+                             # We find "Gymnasium" that is following the toggle, but BEFORE the next Room List?
+                             # No, usually safe to just find "following::*[contains(., '体育室')][1]" relative to that toggle
+                             # BUT we must be careful not to jump to next facility.
+                             # We can check distance or hierarchy?
+                             
+                             # Let's assume the hierarchy is:
+                             # Container
+                             #   Header (cand)
+                             #   Toggle (room_list_toggle)
+                             #   Content (contains Gym)
+                             
+                             # So we search for Gym relative to Toggle.
+                             gym_row = room_list_toggle.find_element(By.XPATH, "./following::*[contains(text(), '体育室')][1]")
+                             
+                             # 4. CLICK BUTTON (SCOPED)
+                             # Find button inside/relative to gym_row
+                             btn = gym_row.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '予約')][1]")
+                             
+                             if btn:
+                                 if _status_callback: _status_callback(f"🚀 SCOPED SUCCESS: '{fac}' のボタンを特定。")
+                                 found_facilities_log.append(f"Scoped Click: {fac}")
+                                 
+                                 link_href = btn.get_attribute('href')
+                                 if link_href:
+                                     target_urls.append({"url": link_href, "raw_text": fac})
+                                     is_search_success = True
+                                     break # Done for this facility
+                                 else:
+                                     driver.execute_script("arguments[0].click();", btn)
+                                     time.sleep(2)
+                                     is_search_success = True 
+                                     break
+                                     
+                         except Exception as inner_e:
+                             # Not the right header or structure
+                             continue
+                             
                 except Exception as e:
-                    # Log but continue to next facility
-                    # logger.warning(f"Failed to find gym for {fac}: {e}")
+                    logger.warning(f"Scope search error for {fac}: {e}")
                     continue
         
-        # If Specific Search failed, Fallback: GET ANY LINK
+        # Fallback Logic
         if not target_urls and not is_search_success:
-             if _status_callback: _status_callback("⚠️ 指定施設のボタンが見つかりません。利用可能な最初のボタンを試行します...")
+             if _status_callback: _status_callback("⚠️ 指定施設のボタンが見つかりません(Scoped)。代替策を試行します...")
+             # Just try to brute force any gym match
              try:
-                 fallback_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar')][1]")
-                 if fallback_links:
-                     link = fallback_links[0]
-                     href = link.get_attribute("href")
-                     text = link.text
-                     if _status_callback: _status_callback(f"✅ 代替ボタンを発見: {text}")
-                     target_urls.append({"url": href, "raw_text": "Fallback Facility"})
-                     found_facilities_log.append(f"Fallback: {text}")
+                 # Find ANY "Gymnasium" text then the button
+                 fallback_gym = driver.find_element(By.XPATH, "(//*[contains(text(), '体育室')])[1]")
+                 fallback_btn = fallback_gym.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '予約')][1]")
+                 
+                 link_href = fallback_btn.get_attribute('href')
+                 if link_href:
+                     target_urls.append({"url": link_href, "raw_text": "Fallback Gym"})
+                 else:
+                     driver.execute_script("arguments[0].click();", fallback_btn)
+                     pass
              except: pass
 
-        if not target_urls and not is_search_success: # Check success purely on clicks as well
-            # If we clicked via JS, we might have navigated, so we can't truly say 'failed' unless we check URL or something
-            # But for now, if target_urls is empty and we didn't just click...
-            # Actually, `is_search_success` handles the JS click case? 
-            # Wait, if we did JS click, we loop terminates for that facility.
-            # But the MAIN loop `for idx, target in enumerate(target_urls)` relies on `target_urls`.
-            # If we JS clicked, we are already on the page?
-            # Ideally we should gather URLs. If JS click happened, we probably should have added it.
-            # Corrected logic: `driver.execute_script...` clicks it. 
-            # If we navigated, `driver.current_url` changes.
-            # But the code structure expects a list of URLs to visit.
-            # If we clicked, we are ON the detail page. We can just process it once?
-            # To support multiple facilities, we need URLs... 
-            # If the site opens in same tab, we can't easily do multiple without Going Back.
-            # The current architecture `driver.get(url)` implies we have direct links.
-            # If we JS click, we are verifying.
-            pass
-
-        if not target_urls:
-             # Just in case we didn't populate target_urls but maybe clicked?
-             # If we are here, likely we failed.
+        if not target_urls and not is_search_success:
             if _status_callback: _status_callback("❌ 有効なリンクが一つも見つかりませんでした。")
             if _debug_placeholder:
                 html_source = driver.execute_script("return document.body.innerHTML;")
