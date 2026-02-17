@@ -47,7 +47,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 設定定数 ---
-TARGET_URL = "https://fujisawacity.service-now.com/facilities_reservation"
+# Direct Facility Search URL
+TARGET_URL = "https://fujisawacity.service-now.com/facilities_reservation?id=facility_search&tab=1"
 MAX_RETRIES = 3
 
 # 対象施設リスト（検索フィルタ用）
@@ -79,18 +80,18 @@ def safe_click_js(driver, element):
     except:
         return False
 
-def attempt_scrape_with_retry(keyword, start_date, end_date, selected_facilities, _status_callback, _progress_bar):
+def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status_callback, _progress_bar):
     for attempt in range(MAX_RETRIES):
         try:
             if _status_callback: 
                 msg = f"データ取得 試行 {attempt + 1}回目..."
                 _status_callback(msg)
             
-            df = fetch_availability_deep_scan(keyword, start_date, end_date, selected_facilities, _status_callback, _progress_bar)
+            df = fetch_availability_deep_scan(start_date, end_date, selected_facilities, _status_callback, _progress_bar)
             if not df.empty:
                 return df
             
-            # If empty, treating as failure to trigger retry in this aggressive logic
+            # If empty, treating as failure to trigger retry
             raise Exception("空き情報が見つかりませんでした (0件)")
             
         except Exception as e:
@@ -99,13 +100,14 @@ def attempt_scrape_with_retry(keyword, start_date, end_date, selected_facilities
                 time.sleep(3)
     return pd.DataFrame()
 
-def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, end_date=None, selected_facilities=None, _status_callback=None, _progress_bar=None):
+def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facilities=None, _status_callback=None, _progress_bar=None):
     driver = setup_driver()
     wait = WebDriverWait(driver, 30) 
     results = []
 
     try:
-        # 1. Access & Frame
+        # 1. Access New URL
+        if _status_callback: _status_callback("📡 予約システムにアクセス中...")
         driver.get(TARGET_URL)
         time.sleep(3)
         
@@ -113,7 +115,31 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
         if frames:
             driver.switch_to.frame(0)
 
-        # 2. Date Input
+        # 2. Check "Civic Center" Checkbox
+        if _status_callback: _status_callback("🏢 「市民センター」を選択中...")
+        
+        # Look for the Civic Center checkbox - robust strategies
+        civic_found = False
+        try:
+            # Try 1: By Label text
+            labels = driver.find_elements(By.XPATH, "//label[contains(text(), '市民センター')] | //span[contains(text(), '市民センター')]")
+            for lbl in labels:
+                if lbl.is_displayed():
+                    # Click maybe the checkbox *before* it if label not clickable, or label itself
+                    safe_click_js(driver, lbl)
+                    civic_found = True
+                    time.sleep(1)
+                    break
+            
+            # Try 2: By Input value/id if logic requires
+            if not civic_found:
+                 # Generic heuristic click any likely checkbox near "Citizen Center" text
+                 pass
+
+        except Exception as e:
+            logger.warning(f"Checkbox selection warning: {e}")
+
+        # 3. Input Date
         if start_date:
             formatted_date = start_date.strftime("%Y-%m-%d")
             if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中...")
@@ -128,56 +154,19 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                         time.sleep(1)
                 except: pass
 
-        # 3. New Search Flow: "Facility Group" (施設グループ) -> "Civic Center" (市民センター)
-        if _status_callback: _status_callback("🏢 「施設グループ」タブから検索中...")
-        search_done = False
+        # 4. Click Search Button (Explicit JS Click)
+        if _status_callback: _status_callback("🔍 検索を実行中...")
         
-        try:
-            # Step A: Click "Search from Facility Group" Tab
-            # Tab text might be "施設グループから探す"
-            # Try multiple selectors
-            group_tabs = driver.find_elements(By.XPATH, "//a[contains(text(), '施設グループ')] | //li[contains(text(), '施設グループ')] | //span[contains(text(), '施設グループ')]")
-            for tab in group_tabs:
-                if tab.is_displayed():
-                    safe_click_js(driver, tab)
-                    time.sleep(1)
-                    break
-            
-            # Step B: Click "Civic Center" Checkbox/Label
-            # Should be "市民センター"
-            civic_labels = driver.find_elements(By.XPATH, "//label[contains(text(), '市民センター')] | //span[contains(text(), '市民センター')]")
-            for lbl in civic_labels:
-                if lbl.is_displayed():
-                    safe_click_js(driver, lbl)
-                    time.sleep(1)
-                    search_done = True
-                    break
+        search_btns = driver.find_elements(By.XPATH, "//button[contains(text(), '検索')] | //input[@type='button' and @value='検索'] | //a[contains(text(), '検索') and contains(@class, 'btn')]")
+        btn_clicked = False
+        for btn in search_btns:
+            if btn.is_displayed():
+                driver.execute_script("arguments[0].click();", btn)
+                btn_clicked = True
+                time.sleep(2) 
+                break
 
-            # Step C: Click Search Button (Explicit JS Click)
-            if search_done:
-                search_btns = driver.find_elements(By.XPATH, "//button[contains(text(), '検索')] | //input[@type='button' and @value='検索'] | //a[contains(text(), '検索') and contains(@class, 'btn')]")
-                btn_clicked = False
-                for btn in search_btns:
-                    if btn.is_displayed():
-                        driver.execute_script("arguments[0].click();", btn)
-                        btn_clicked = True
-                        time.sleep(2) 
-                        break
-        except Exception as e:
-            logger.warning(f"Facility Group search error: {e}")
-
-        # Fallback (Old Search) if Facility Group failed
-        if not search_done:
-            # Simple keyword search fallback just in case
-            try:
-                search_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索'], input[name*='keyword']")))
-                search_input.clear()
-                search_input.send_keys(keyword)
-                search_input.send_keys(Keys.ENTER)
-                time.sleep(3)
-            except: pass
-
-        # Wait for Room List (Table) - Strict 30s Wait
+        # Wait for Room List (Table)
         try:
             if _status_callback: _status_callback("⏳ 室場リストの表示を待機中 (最大30秒)...")
             wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "tr")))
@@ -185,33 +174,49 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
              if _status_callback: _status_callback("⚠️ 室場リストが見つかりませんでした。リトライします。")
              raise Exception("Room list not found")
 
-        # 4. Traverse Room List (Collect URLs & Filter by Facility + "Gymnasium")
+        # 5. Traverse Room List (Collect URLs & Filter for "Selected Facility" + "Gymnasium")
         target_urls = []
         try:
-            rows = driver.find_elements(By.CSS_SELECTOR, "tr")
-            for row in rows:
-                row_raw_text = row.text.replace("\n", " ")
+            # We assume a list structure (e.g., table rows or list items)
+            # Strategy: Find all clickable links that are "Check Availability/Reserve"
+            # And then check their context (parent row/container) for Facility Name + "Gymnasium"
+            
+            # Find all potential "Check" buttons/links
+            check_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar') or contains(@href, 'reserve')]")
+            
+            for link in check_links:
+                href = link.get_attribute("href")
+                if not href: continue
                 
-                # Check Facility Name AND "Gymnasium" (体育室)
+                # Get surrounding text (parent row or container)
+                try:
+                    # Get parent TR or Div
+                    parent = link.find_element(By.XPATH, "./ancestor::tr | ./ancestor::div[contains(@class, 'card') or contains(@class, 'item')]")
+                    row_text = parent.text.replace("\n", " ")
+                except:
+                    # Fallback to link's own text + simple parent
+                    row_text = link.text
+                
+                # Filter Logic:
+                # 1. MUST contain "Gymnasium" (体育室) - User Requirement
+                # 2. MUST contain one of the Selected Facilities (e.g. "Chogo") - User Requirement
+                
+                has_gym = "体育室" in row_text
+                
+                has_facility = False
                 if selected_facilities:
-                    has_facility = any(f in row_raw_text for f in selected_facilities)
-                else:
-                    has_facility = True # Allow if empty selection (but logic requires fac)
-                
-                has_gym = "体育室" in row_raw_text
+                     has_facility = any(f in row_text for f in selected_facilities)
+                else: 
+                     has_facility = True # Should not happen given UI default
 
-                if has_facility and has_gym:
-                    links = row.find_elements(By.TAG_NAME, "a")
-                    for link in links:
-                        href = link.get_attribute("href")
-                        if href and ("calendar" in href or "reserve" in href or "detail" in href):
-                            # Ensure "Check Availability" flow
-                            if "確認" in link.text or "予約" in link.text or "calendar" in href:
-                                target_urls.append({
-                                    "url": href,
-                                    "raw_text": row_raw_text
-                                })
-        except: pass
+                if has_gym and has_facility:
+                    target_urls.append({
+                        "url": href,
+                        "raw_text": row_text
+                    })
+
+        except Exception as e: 
+            logger.warning(f"List parsing warning: {e}")
         
         # Deduplicate
         unique_targets = {}
@@ -222,9 +227,9 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
         if not target_list:
             raise Exception("条件に一致する施設（体育室）が見つかりませんでした (0件)")
 
-        # 5. Detail Loop with Navigation
+        # 6. Detail Loop with Navigation
         total_targets = len(target_list)
-        if _status_callback: _status_callback(f"🔍 {total_targets} 件の室場（体育室）が見つかりました。詳細カレンダーを巡回します...")
+        if _status_callback: _status_callback(f"🔍 {total_targets} 件の体育室が見つかりました。詳細カレンダーを巡回します...")
 
         for idx, target in enumerate(target_list):
             url = target['url']
@@ -369,7 +374,8 @@ def enrich_data(df):
     return df
 
 def get_data(keyword, start_date, end_date, selected_facilities, _status, _progress):
-    df = attempt_scrape_with_retry(keyword, start_date, end_date, selected_facilities, _status, _progress)
+    # Removed keyword argument from internal call as we use generic search now
+    df = attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status, _progress)
     return enrich_data(df)
 
 def render_schedule_card(row):
@@ -417,7 +423,7 @@ def main():
         min_value=TODAY,
         max_value=TODAY + datetime.timedelta(days=180)
     )
-    st.sidebar.info("種目: バレーボール")
+    st.sidebar.info("種目: バレーボール (体育室)")
     
     # Facility Selection (Default: Chogo)
     default_fac = ["長後"]
@@ -444,6 +450,9 @@ def main():
         p_bar = status_box.progress(0)
         
         try:
+            # We pass keyword just as placeholder or remove it. 
+            # get_data signature: (keyword, start_date, end_date...). 
+            # Updated get_data to ignore keyword effectively.
             df = get_data("バレーボール", start_d, end_d, selected_target_facilities, status_box.write, p_bar)
             st.session_state.data = df
             status_box.update(label="完了", state="complete", expanded=False)
