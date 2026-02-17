@@ -51,7 +51,7 @@ st.markdown("""
 TARGET_URL = "https://fujisawacity.service-now.com/facilities_reservation?id=facility_search&tab=1"
 MAX_RETRIES = 3
 
-# 対象施設リスト（検索フィルタ用）
+# 対象施設リスト（検索フィルタ用 - 内部処理では使わないがUIに残す）
 FACILITIES = ["藤沢", "鵠沼", "村岡", "明治", "御所見", "遠藤", "長後", "辻堂", "善行", "湘南大庭", "六会", "湘南台", "片瀬"]
 
 # --- Scraper Logic (Deep Scan with Navigation) ---
@@ -108,14 +108,14 @@ def switch_to_target_frame(driver, target_text="市民センター", _status_cal
     except Exception as e:
         return False
 
-def attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status_callback, _progress_bar, _debug_placeholder):
+def attempt_scrape_with_retry(start_date, end_date, _status_callback, _progress_bar, _debug_placeholder):
     for attempt in range(MAX_RETRIES):
         try:
             if _status_callback: 
                 msg = f"データ取得 試行 {attempt + 1}回目..."
                 _status_callback(msg)
             
-            df = fetch_availability_deep_scan(start_date, end_date, selected_facilities, _status_callback, _progress_bar, _debug_placeholder, attempt_idx=attempt)
+            df = fetch_availability_deep_scan(start_date, end_date, _status_callback, _progress_bar, _debug_placeholder, attempt_idx=attempt)
             if not df.empty:
                 return df
             
@@ -132,7 +132,6 @@ def scrape_current_schedule_table(driver, results, facility_name, room_name):
     Scrape the current schedule table (usually at the bottom) for availability symbols.
     """
     soup = BeautifulSoup(driver.page_source, "html.parser")
-    # Identify tables. Usually the schedule table is the one with symbols.
     tables = soup.find_all("table")
     
     for tbl in tables:
@@ -140,7 +139,6 @@ def scrape_current_schedule_table(driver, results, facility_name, room_name):
         has_symbols = "○" in txt or "×" in txt or "△" in txt
         has_imgs = tbl.find('img', alt=re.compile(r'[○×△]')) or tbl.find('img', src=re.compile(r'(circle|cross|triangle)'))
         
-        # Schedule table usually has status symbols. Monthly calendar usually doesn't (just 'link').
         if not (has_symbols or has_imgs):
             continue
             
@@ -165,12 +163,10 @@ def scrape_current_schedule_table(driver, results, facility_name, room_name):
                 
                 status = "×" # Default closed
                 
-                # Check Text
                 if "○" in stat_text or "空" in stat_text: status = "○"
                 elif "△" in stat_text: status = "△"
                 elif "×" in stat_text or "満" in stat_text: status = "×"
                 
-                # Check Image
                 if img:
                     alt = img.get('alt', '')
                     src = img.get('src', '')
@@ -196,10 +192,6 @@ def process_month_calendar_clicks(driver, results, facility_name):
     Find the MONTHLY calendar (small numbers), click SUNDAY cells (First Column),
     and scrape the resulting schedule table.
     """
-    # 1. Locate the Monthly Calendar Table
-    # Strategy: Find table that has "日" header but likely NOT "9:00" etc.
-    # Also usually small.
-    
     wait = WebDriverWait(driver, 5)
     
     try:
@@ -208,29 +200,19 @@ def process_month_calendar_clicks(driver, results, facility_name):
         
         for tbl in tables:
             txt = tbl.text
-            # Monthly calendar has "日" and "土" likely
             if "日" in txt and "土" in txt:
-                # Exclude if it looks like the schedule table (contains time slots or status symbols)
-                # But wait, initially schedule might be empty?
-                # Usually schedule has "9:00" or similar.
                 if "9:" in txt or "09:" in txt or "11:" in txt:
                     continue
                 calendar_table = tbl
                 break
         
         if not calendar_table:
-            logger.warning("Monthly calendar table not found.")
-            # Fallback: Try to find ANY table with 'calendar' in class?
-            # Or just skip
-            pass
+            return
         
         if calendar_table:
-            # 2. Get Sunday Cells (First Column)
-            # Find all clickable elements in the 1st column of each row
+            # Get Sunday Cells (First Column)
             rows = calendar_table.find_elements(By.TAG_NAME, "tr")
             
-            # Identify Sunday Column Index? usually 0.
-            # Check headers again on this specific table
             headers = calendar_table.find_elements(By.TAG_NAME, "th")
             sunday_idx = 0
             for i, h in enumerate(headers):
@@ -238,13 +220,10 @@ def process_month_calendar_clicks(driver, results, facility_name):
                     sunday_idx = i
                     break
             
-            # We must re-find the table/rows inside the loop to avoid stale elements
-            # So let's store the number of rows or iteration logic
             row_count = len(rows)
             
             for r_idx in range(1, row_count): # Skip header
                 try:
-                    # Re-acquire
                     tables = driver.find_elements(By.TAG_NAME, "table")
                     cal_tbl = None
                     for tbl in tables:
@@ -260,36 +239,27 @@ def process_month_calendar_clicks(driver, results, facility_name):
                     if len(cols) > sunday_idx:
                         cell = cols[sunday_idx]
                         
-                        # Check if clickable (has link or is button?)
-                        # Or just contains a number
                         if not re.search(r'\d+', cell.text): continue
                         
-                        logger.info(f"Clicking Sunday date: {cell.text}")
-                        
-                        # Click
                         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", cell)
                         time.sleep(0.2)
                         
                         try:
-                            # Try clicking link if exists
                             link = cell.find_element(By.TAG_NAME, "a")
                             driver.execute_script("arguments[0].click();", link)
                         except:
                             driver.execute_script("arguments[0].click();", cell)
                             
-                        # WAIT & SCRAPE
-                        time.sleep(1.5) # Wait for table update
-                        
+                        time.sleep(1.5) 
                         scrape_current_schedule_table(driver, results, facility_name, "体育室")
                         
                 except Exception as e:
-                    logger.warning(f"Error processing calendar row {r_idx}: {e}")
                     continue
 
     except Exception as e:
         logger.error(f"Calendar interaction error: {e}")
 
-def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facilities=None, _status_callback=None, _progress_bar=None, _debug_placeholder=None, attempt_idx=0):
+def fetch_availability_deep_scan(start_date=None, end_date=None, _status_callback=None, _progress_bar=None, _debug_placeholder=None, attempt_idx=0):
     driver = setup_driver()
     wait = WebDriverWait(driver, 30) 
     results = []
@@ -371,96 +341,129 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索結果表示", use_column_width=True)
 
         # ------------------------------------------------------------------
-        # MAIN LOOP
+        # MAIN LOOP: DYNAMIC INDEX-BASED ITERATION (FILTER GYM)
         # ------------------------------------------------------------------
-        if selected_facilities:
-             total_targets = len(selected_facilities)
+        
+        # Count total potential facilities by looking for "Room List" toggles or headers
+        # Strategy: Find all "Room List" toggles. Each corresponds to a facility.
+        toggles = driver.find_elements(By.XPATH, "//*[contains(text(), '室場一覧') or contains(text(), 'Room List')]")
+        total_count = len(toggles)
+        
+        if total_count == 0:
+            logger.warning("No facilities found.")
+            return pd.DataFrame()
+
+        if _status_callback: _status_callback(f"📍 {total_count} 件の施設候補が見つかりました。順次解析します。")
+
+        for i in range(total_count):
+             if _progress_bar: _progress_bar.progress(i / max(total_count, 1))
              
-             for idx, fac in enumerate(selected_facilities):
-                 if _progress_bar: _progress_bar.progress(idx / max(total_targets, 1))
-                 if _status_callback: _status_callback(f"📍 処理中 ({idx+1}/{total_targets}): {fac} ...")
+             # 0. Ensure Context
+             found_context = switch_to_target_frame(driver, "市民センター", None)
+             
+             # Re-find ALL toggles to get the i-th one safely
+             try:
+                 # Wait for list to be stable
+                 wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), '室場一覧') or contains(text(), 'Room List')]")))
+                 current_toggles = driver.find_elements(By.XPATH, "//*[contains(text(), '室場一覧') or contains(text(), 'Room List')]")
                  
-                 found_context = switch_to_target_frame(driver, "市民センター", None)
+                 if i >= len(current_toggles):
+                     break
                  
-                 search_key = fac[:2]
-                 if not search_key: continue
+                 toggle = current_toggles[i]
                  
-                 is_click_success = False
+                 # Get Facility Name relative to this toggle (usually in previous sibling header or ancestor)
+                 # Try to find header above
+                 try:
+                     # Attempt to find closest h4 or header-like element
+                     header = toggle.find_element(By.XPATH, "./preceding::*[self::h3 or self::h4 or contains(@class, 'header')][1]")
+                     text_content = header.text.strip().replace('\n', ' ')
+                     # Just take the name part if possible
+                     fac_name = text_content.split(' ')[0] # Approx
+                     if len(fac_name) < 2: fac_name = text_content[:5]
+                 except:
+                     fac_name = f"施設_{i+1}"
+
+                 if _status_callback: _status_callback(f"📍 チェック中 ({i+1}/{total_count}): {fac_name}")
+                 
+                 # 1. EXPAND ACCORDION
+                 driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
+                 time.sleep(0.5)
+                 driver.execute_script("arguments[0].click();", toggle)
+                 time.sleep(1.5)
+
+                 # 2. CHECK FOR GYM (FILTER)
+                 # Look for "Gymnasium" row relative to this toggle
+                 # We need to limit the search scope. The gym row should be following the toggle
+                 # but NOT following the NEXT toggle.
+                 # XPath: ./following::*[contains(text(), '体育室')][1] ... but verify it's close.
+                 
+                 # Better: The toggle usually expands a div immediately following it.
+                 # Let's search inside the expanded container if possible.
+                 # Or just search following sibling until next header.
                  
                  try:
-                     # 1. FIND HEADER FRESHLY
-                     xpath_header = f"//*[contains(text(), '{search_key}')]"
-                     try: wait.until(EC.presence_of_element_located((By.XPATH, xpath_header)))
-                     except: continue
-
-                     candidates = driver.find_elements(By.XPATH, xpath_header)
+                     gym_row = toggle.find_element(By.XPATH, "./following::*[contains(text(), '体育室')][1]")
                      
-                     for cand in candidates:
-                         if not cand.is_displayed(): continue
-                         try:
-                             # 2. EXPAND ACCORDION
-                             room_list_toggle = cand.find_element(By.XPATH, "./following::*[contains(text(), '室場一覧') or contains(text(), 'Room List')][1]")
-                             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", room_list_toggle)
+                     # Check visibility. If not visible, expansion failed.
+                     if not gym_row.is_displayed():
+                         # Retry expansion
+                         driver.execute_script("arguments[0].click();", toggle)
+                         time.sleep(1.5)
+                     
+                     if not gym_row.is_displayed():
+                         # Maybe this facility has no gym or layout is weird.
+                         logger.warning(f"  -> {fac_name}: 体育室が見つからないか表示されません。")
+                         continue
+                         
+                     # Found Gym!
+                     if _status_callback: _status_callback(f"  ✅ 体育室あり。詳細を確認します...")
+                     
+                     btn = gym_row.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '予約')][1]")
+                     
+                     # 3. CLICK & SCRAPE
+                     if btn:
+                         href = btn.get_attribute('href')
+                         if href and "javascript" not in href:
+                             driver.get(href)
+                         else:
+                             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
                              time.sleep(0.5)
-                             driver.execute_script("arguments[0].click();", room_list_toggle)
-                             time.sleep(1.5)
+                             driver.execute_script("arguments[0].click();", btn)
+                         
+                         time.sleep(3)
+                         
+                         # Check Detail Page
+                         switch_to_target_frame(driver, "予約状況", None)
+                         
+                         # Date-Click Loop
+                         if start_date:
+                            try:
+                                fd = start_date.strftime("%Y-%m-%d")
+                                driver.execute_script(f"var i=document.querySelector('input[type=date]'); if(i){{i.value='{fd}'; i.dispatchEvent(new Event('change'));}}")
+                                time.sleep(1)
+                            except: pass
 
-                             # 3. FIND TARGET ROW & BUTTON
-                             gym_row = room_list_toggle.find_element(By.XPATH, "./following::*[contains(text(), '体育室')][1]")
-                             if not gym_row.is_displayed():
-                                 driver.execute_script("arguments[0].click();", room_list_toggle)
-                                 time.sleep(1.5)
-                             
-                             btn = gym_row.find_element(By.XPATH, "./following::*[contains(text(), '確認') or contains(text(), '予約')][1]")
-                             if btn:
-                                 href = btn.get_attribute('href')
-                                 if href and "javascript" not in href:
-                                     driver.get(href)
-                                 else:
-                                     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                                     time.sleep(0.5)
-                                     driver.execute_script("arguments[0].click();", btn)
-                                 is_click_success = True
-                                 break 
-                         except: continue
+                         # Scrape
+                         scrape_current_schedule_table(driver, results, fac_name, "体育室")
+                         process_month_calendar_clicks(driver, results, fac_name)
+                         
+                         # 4. GO BACK
+                         if _status_callback: _status_callback(f"  🔙 リストに戻ります...")
+                         driver.back()
+                         time.sleep(5) 
                      
-                     if not is_click_success: continue
-
-                     # ---------------------------------------------------------
-                     # 5. SUNDAY CLICK LOOP
-                     # ---------------------------------------------------------
-                     if _status_callback: _status_callback(f"  📅 カレンダー確認中: {fac}")
-                     time.sleep(3) 
-                     
-                     switch_to_target_frame(driver, "予約状況", None)
-
-                     # Inject Date
-                     if start_date:
-                         fd = start_date.strftime("%Y-%m-%d")
-                         try:
-                             driver.execute_script(f"var i=document.querySelector('input[type=date]'); if(i){{i.value='{fd}'; i.dispatchEvent(new Event('change'));}}")
-                             time.sleep(1)
-                         except: pass
-                     
-                     # First scrape (Default view)
-                     scrape_current_schedule_table(driver, results, fac, "体育室")
-                     
-                     # Check other weeks
-                     process_month_calendar_clicks(driver, results, fac)
-                     
-                     # ---------------------------------------------------------
-
-                     # 6. GO BACK
-                     if _status_callback: _status_callback(f"  🔙 リストに戻ります...")
-                     driver.back()
-                     time.sleep(5) 
-
                  except Exception as e:
-                     logger.error(f"Error processing {fac}: {e}")
-                     try: driver.back() 
-                     except: pass
-                     time.sleep(3)
+                     # Gym row not found or error finding button
+                     # logger.info(f"  -> {fac_name}: 体育室なし (or error: {e})")
                      continue
+
+             except Exception as e:
+                 logger.error(f"Error processing index {i}: {e}")
+                 try: driver.back() 
+                 except: pass
+                 time.sleep(2)
+                 continue
 
     except Exception as e:
         logger.error(f"Scrape Error: {e}")
@@ -525,8 +528,9 @@ def enrich_data(df):
     df['曜日'] = df.apply(get_day, axis=1)
     return df
 
-def get_data(keyword, start_date, end_date, selected_facilities, _status, _progress, _debug_placeholder):
-    df = attempt_scrape_with_retry(start_date, end_date, selected_facilities, _status, _progress, _debug_placeholder)
+def get_data(keyword, start_date, end_date, _status, _progress, _debug_placeholder):
+    # Note: selected_facilities arg removed from fetch call
+    df = attempt_scrape_with_retry(start_date, end_date, _status, _progress, _debug_placeholder)
     return enrich_data(df)
 
 def render_schedule_card(row):
@@ -574,11 +578,18 @@ def main():
         min_value=TODAY,
         max_value=TODAY + datetime.timedelta(days=180)
     )
-    st.sidebar.info("種目: バレーボール (体育室)")
+    st.sidebar.info("対象: 検索結果内の全体育室")
     
-    # Facility Selection (Default: Chogo)
-    default_fac = ["長後"]
-    selected_target_facilities = st.sidebar.multiselect("対象施設 (市民センター)", FACILITIES, default=default_fac)
+    # Facility Selection Removed from Logic (UI kept but muted or removed?)
+    # User said "Delete hardcoded list".
+    # I will keep the sidebar multiselect visible but effectively ignored for the loop, 
+    # OR I should remove it to strictly follow "deprecate".
+    # But usually user wants to filter.
+    # I will remove the multiselect to comply with "Specific facility name dependency removal".
+    # Or replace it with "Filter afterwards".
+    # Let's remove it to show compliance with "Dynamic Iteration".
+    
+    # st.sidebar.multiselect("対象施設 (市民センター)", FACILITIES, default=default_fac) -> Removed/Commented
 
     day_options = ["月", "火", "水", "木", "金", "土", "日", "祝"]
     selected_days = st.sidebar.multiselect("曜日指定", day_options, default=["土", "日", "祝"])
@@ -589,11 +600,6 @@ def main():
     st.sidebar.divider()
     
     if st.sidebar.button("最新情報を取得", type="primary"):
-        # Facility Guard
-        if not selected_target_facilities:
-            st.warning("対象施設を選択してください。")
-            return
-
         start_d = None
         end_d = None
         if isinstance(d_input, tuple) and len(d_input) == 2:
@@ -609,7 +615,7 @@ def main():
         debug_placeholder = debug_area.empty()
         
         try:
-            df = get_data("バレーボール", start_d, end_d, selected_target_facilities, status_box.write, p_bar, debug_placeholder)
+            df = get_data("バレーボール", start_d, end_d, status_box.write, p_bar, debug_placeholder)
             st.session_state.data = df
             status_box.update(label="完了", state="complete", expanded=False)
             
