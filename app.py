@@ -96,7 +96,7 @@ def switch_to_target_frame(driver, target_text="市民センター", _status_cal
         frames = driver.find_elements(By.TAG_NAME, "iframe")
         
         if not frames:
-             if _status_callback: _status_callback("⚠️ iframeが見つかりません。メインコンテンツを探索します。")
+             # if _status_callback: _status_callback("⚠️ iframeが見つかりません。メインコンテンツを探索します。")
              return False
 
         if _status_callback: _status_callback(f"🔍 {len(frames)} 件のiframeを探索中...")
@@ -272,15 +272,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
         try:
             if _status_callback: _status_callback("⏳ 検索結果（施設リスト）の表示を待機中 (最大30秒)...")
             
-            # Re-verify/Switch frame if page reloaded
-            # Sometimes search causes a reload or update
-            # We assume we stay in frame or elements appear in current frame
-            # But let's check.
-            
-            # Robust wait allowing for frame checks?
-            # WebDriverWait(driver) checks in current context.
-            # If page refreshes, context might be lost.
-            
+            # Use improved wait with iframe fallback
             try:
                 # Simple check first
                 wait.until(
@@ -289,7 +281,6 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                     )
                 )
             except:
-                # If timeout, try scanning frames again for result
                  if _status_callback: _status_callback("⚠️ コンテキストロストの可能性。結果フレームを再探索します...")
                  switch_to_target_frame(driver, "室場一覧", _status_callback)
                  wait.until(
@@ -297,7 +288,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                         (By.XPATH, "//*[contains(text(), '室場') or contains(text(), '一覧') or contains(text(), '確認')]")
                     )
                 )
-
+            
             time.sleep(2) 
 
             # --- Debug Screenshot: After Results Loaded ---
@@ -305,19 +296,19 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                 _debug_placeholder.image(driver.get_screenshot_as_png(), caption="検索結果表示確認", use_column_width=True)
 
         except Exception as e:
-             # --- Debug Screenshot: Error State ---
              if _debug_placeholder:
                  _debug_placeholder.image(driver.get_screenshot_as_png(), caption="エラー: 検索結果待機タイムアウト", use_column_width=True)
              if _status_callback: _status_callback("⚠️ 検索結果の表示待機中にタイムアウトしました。")
              raise Exception("Room list not found (Timeout)")
 
-        # 5. Filter Results: Find specific Facility Card -> "Gymnasium" Row
+        # 5. Filter Results: FINDING FACILITIES with LOGGING and FUZZY MATCH
         if _status_callback: _status_callback(f"📍 対象施設 ({selected_facilities}) を探索中...")
         
         target_urls = []
+        found_facilities_log = set()
         
-        # Strategy: Iterate through potential facility cards
-        check_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar') or contains(@href, 'reserve')]")
+        # Generic strategy to find all "actionable" links that might be facilities
+        check_links = driver.find_elements(By.XPATH, "//a[contains(text(), '確認') or contains(text(), '予約') or contains(@href, 'calendar') or contains(@href, 'reserve') or contains(text(), '一覧')]")
         
         for link in check_links:
             try:
@@ -325,14 +316,31 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                 parent = link.find_element(By.XPATH, "./ancestor::tr | ./ancestor::div[contains(@class, 'panel') or contains(@class, 'card') or contains(@class, 'list-group-item')]")
                 context_text = parent.text.replace("\n", " ")
                 
-                # Filter 1: Must be one of the selected facilities
+                # Log found facility context for debugging
+                # Extract potential facility name (heuristic)
+                # We save context_text to log later
+                found_facilities_log.add(context_text[:50] + "...") 
+                
+                # Filter 1: Fuzzy Match for Facility Name
+                # Clean whitespace
+                context_normalized = re.sub(r'\s+', '', context_text)
+                
+                is_target_facility = False
                 if selected_facilities:
-                    is_target_facility = any(f in context_text for f in selected_facilities)
+                    for f in selected_facilities:
+                        f_norm = f.strip()
+                        if f_norm in context_normalized:
+                            is_target_facility = True
+                            break
                 else:
-                    is_target_facility = True
+                    is_target_facility = True # No filter
                 
                 # Filter 2: Must be "Gymnasium" (体育室) 
-                is_gym = "体育室" in context_text
+                # Also Fuzzy
+                is_gym = "体育室" in context_text or "Sport" in context_text or "Gym" in context_text
+                
+                # Only if target facility is found, check for gym or if gym is separate line
+                # On some screens, "Check Availability" (Action) is next to "Gymnasium" (Room) matches
                 
                 if is_target_facility and is_gym:
                     href = link.get_attribute("href")
@@ -344,6 +352,10 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             except:
                 continue
                 
+        # LOGGING FOUND FACILITIES
+        if _status_callback and found_facilities_log:
+             _status_callback(f"📋 発見した施設リスト(一部): {list(found_facilities_log)[:5]}")
+
         # Deduplicate
         unique_targets = {}
         for t in target_urls:
@@ -352,6 +364,10 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
 
         if not target_list:
             if _status_callback: _status_callback("⚠️ 条件に一致する施設が見つかりません。")
+            # Dump debug info
+            if _debug_placeholder:
+                 _debug_placeholder.write("Debug: Found Text Contexts")
+                 _debug_placeholder.write(list(found_facilities_log))
             raise Exception("条件に一致する施設（体育室）が見つかりませんでした (0件)")
 
         if _debug_placeholder:
@@ -370,12 +386,11 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             
             # Identify Facility
             facility_name = "不明"
-            room_name = "不明"
+            room_name = "体育室"
             known_facilities = FACILITIES + ["秋葉台", "秩父宮", "石名坂", "鵠沼", "北部", "太陽", "八部", "遠藤"]
             for kf in known_facilities:
                 if kf in raw_text:
                     facility_name = kf
-                    room_name = "体育室" 
                     break
             
             if _status_callback: _status_callback(f"解析中 ({idx+1}/{total_targets}): {facility_name} {room_name}")
@@ -387,7 +402,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
             # Re-Verify Frame for Detail Page
             found_context = switch_to_target_frame(driver, "予約状況", _status_callback)
             if not found_context:
-                switch_to_target_frame(driver, "空", _status_callback) # Try other text
+                switch_to_target_frame(driver, "空", _status_callback) 
 
             # HIDE BANNERS (Detail Page)
             try:
