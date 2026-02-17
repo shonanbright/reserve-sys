@@ -109,7 +109,7 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
         if frames:
             driver.switch_to.frame(0)
 
-        # 2. Date Input (Start Date)
+        # 2. Date Input
         if start_date:
             formatted_date = start_date.strftime("%Y-%m-%d")
             if _status_callback: _status_callback(f"📅 開始日を {formatted_date} に設定中...")
@@ -124,20 +124,41 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                         time.sleep(1)
                 except: pass
 
-        # 3. Purpose Search
-        if _status_callback: _status_callback(f"🏐 「{keyword}」で施設を検索中...")
+        # 3. Category Search (Indoor Sports -> Volleyball)
+        if _status_callback: _status_callback("🏐 カテゴリ「屋内スポーツ」→「バレーボール」を選択中...")
         search_done = False
         
         try:
-            links = driver.find_elements(By.PARTIAL_LINK_TEXT, keyword)
-            for link in links:
-                if link.is_displayed():
-                    safe_click_js(driver, link)
-                    search_done = True
-                    time.sleep(3)
+            # Step A: Click "Indoor Sports" (屋内スポーツ)
+            indoor_labels = driver.find_elements(By.XPATH, "//label[contains(text(), '屋内スポーツ')] | //span[contains(text(), '屋内スポーツ')] | //a[contains(text(), '屋内スポーツ')]")
+            for lbl in indoor_labels:
+                if lbl.is_displayed():
+                    safe_click_js(driver, lbl)
+                    time.sleep(1)
                     break
-        except: pass
+            
+            # Step B: Click "Volleyball" (バレーボール)
+            # This might be in a submenu or list that appeared
+            volley_labels = driver.find_elements(By.XPATH, "//label[contains(text(), 'バレーボール')] | //span[contains(text(), 'バレーボール')] | //a[contains(text(), 'バレーボール')]")
+            for lbl in volley_labels:
+                if lbl.is_displayed():
+                    safe_click_js(driver, lbl)
+                    time.sleep(1)
+                    search_done = True
+                    break
 
+            # Step C: Click Search Button
+            if search_done:
+                search_btns = driver.find_elements(By.XPATH, "//button[contains(text(), '検索')] | //input[@type='button' and @value='検索'] | //a[contains(text(), '検索') and contains(@class, 'btn')]")
+                for btn in search_btns:
+                    if btn.is_displayed():
+                        safe_click_js(driver, btn)
+                        time.sleep(3) 
+                        break
+        except Exception as e:
+            logger.warning(f"Category search error: {e}")
+
+        # Fallback to Text Search if Category failed
         if not search_done:
             try:
                 search_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索'], input[name*='keyword']")))
@@ -145,8 +166,7 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                 search_input.send_keys(keyword)
                 search_input.send_keys(Keys.ENTER)
                 time.sleep(3)
-            except: 
-                logger.warning("Keyword search failed")
+            except: pass
 
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
@@ -212,7 +232,6 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
             
             # --- Calendar Navigation Loop (Up to 3 months) ---
             for _ in range(3): 
-                # Scrape Current View
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 calendar_tables = soup.find_all("table")
                 
@@ -225,14 +244,12 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                     rows = tbl.find_all("tr")
                     if not rows: continue
                     
-                    # Parse Headers
                     headers = []
                     try:
                         for th in rows[0].find_all(["th", "td"]):
                             headers.append(th.get_text(strip=True))
                     except: continue
                     
-                    # Parse Rows
                     for tr in rows[1:]:
                         cols = tr.find_all(["th", "td"])
                         if not cols: continue
@@ -257,19 +274,18 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                             })
                     table_found = True
 
-                # Click Next Month?
+                # Click Next Month
                 try:
-                    # Next button selectors
                     next_btns = driver.find_elements(By.XPATH, "//a[contains(text(), '次')] | //button[contains(text(), '次')] | //a[contains(@title, '次')] | //a[contains(@class, 'next')]")
                     clicked = False
                     for btn in next_btns:
                         if btn.is_displayed():
                             safe_click_js(driver, btn)
                             clicked = True
-                            time.sleep(2) # Wait for reload
+                            time.sleep(2)
                             break
                     if not clicked:
-                        break # No more next buttons
+                        break
                 except: 
                     break
 
@@ -311,7 +327,9 @@ def enrich_data(df):
                 if temp_dt < TODAY - datetime.timedelta(days=90):
                     y += 1
             if y and m and d:
-                return datetime.date(y, m, d)
+                # Correct out of range days for Feb etc.
+                try: return datetime.date(y, m, d)
+                except: return None
         except: return None
         return None
 
@@ -411,18 +429,15 @@ def main():
             if not df.empty:
                 mask = pd.Series(True, index=df.index)
                 
-                # Date Filter
                 if 'dt' in df.columns:
                      date_mask = (df['dt'] >= start_d) & (df['dt'] <= end_d)
                      date_mask = date_mask.fillna(False)
                      mask &= date_mask
 
-                # Day Filter
                 if selected_days:
                     day_mask = df['曜日'].isin(selected_days)
                     mask &= day_mask
 
-                # Time Filter
                 if selected_times:
                     time_mask = pd.Series(False, index=df.index)
                     for t in selected_times:
@@ -449,7 +464,6 @@ def main():
                     st.warning("条件に合う空きは見つかりませんでした。")
                     with st.expander("詳細デバッグ (フィルタ前データ)"):
                          st.write(f"取得データ件数: {len(df)}")
-                         st.write(f"日付範囲: {start_d} ~ {end_d}")
                          st.dataframe(df)
             else:
                 st.error("データ取得に失敗しました（または空きがありません）。")
