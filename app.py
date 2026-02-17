@@ -209,18 +209,28 @@ def fetch_availability(keyword="バレーボール"):
 
 
 # --- データ後処理 (日付パース・休日判定) ---
+# 現在年をキャッシュして計算コスト削減
+CURRENT_YEAR = datetime.datetime.now().year
+TODAY = datetime.date.today()
+
 def enrich_data(df):
     if df.empty: return df
 
-    current_year = datetime.datetime.now().year
-    
     def parse_date(date_str):
+        if not isinstance(date_str, str): return None
         try:
+            # 例: "3/15(土)" -> 3, 15
             clean_str = date_str.split('(')[0]
             month, day = map(int, clean_str.split('/'))
-            dt = datetime.date(current_year, month, day)
-            if dt < datetime.date.today():
-                dt = datetime.date(current_year + 1, month, day)
+            
+            # 年またぎの推定
+            # データが過去の日付（例: 今日が12月でデータが1月）なら来年
+            # 今日が1月でデータが12月なら今年（前年データは通常出ない）
+            # 簡易ロジック: 月が現在月より小さく、かつ差が大きい場合は来年とみなす、等
+            # ここでは「日付が今日より前なら来年」とするシンプルロジックを採用
+            dt = datetime.date(CURRENT_YEAR, month, day)
+            if dt < TODAY:
+                dt = datetime.date(CURRENT_YEAR + 1, month, day)
             return dt
         except:
             return None
@@ -295,14 +305,13 @@ def main():
     st.sidebar.header("🔍 検索条件の設定")
     
     # 1. 期間設定
-    today = datetime.datetime.now().date()
-    default_end = today + datetime.timedelta(days=14)
-    min_date = today
-    max_date = today + datetime.timedelta(days=60)
+    default_end = TODAY + datetime.timedelta(days=14)
+    min_date = TODAY
+    max_date = TODAY + datetime.timedelta(days=90) # 少し長めに許可
     
     date_range = st.sidebar.date_input(
-        "検索期間を選択",
-        value=(today, default_end),
+        "検索期間",
+        value=(TODAY, default_end),
         min_value=min_date,
         max_value=max_date
     )
@@ -323,64 +332,75 @@ def main():
 
     if st.sidebar.button("最新情報を取得", type="primary"):
         if isinstance(date_range, tuple) and len(date_range) == 2:
-            st.info(f"{date_range[0]} から {date_range[1]} の範囲で確認中...")
+            st.info(f"{date_range[0]} ～ {date_range[1]} の空き状況を確認中...")
             
             st.session_state.data = pd.DataFrame()
             status_text = st.status("データ取得中... (数分かかります)", expanded=True)
             try:
+                # スクレイピング実行
                 raw_data = get_cached_availability("バレーボール")
+                
                 if not raw_data.empty:
                     st.session_state.data = raw_data
-                    status_text.update(label="取得完了！", state="complete", expanded=False)
+                    status_text.update(label="データ取得完了！ フィルタリングします...", state="complete", expanded=False)
                 else:
                     status_text.update(label="データなし", state="error")
-                    st.warning("空き状況は見つかりませんでした。")
+                    st.warning("システムから空き状況を取得できませんでした。")
             except Exception as e:
-                status_text.update(label="エラー", state="error")
+                status_text.update(label="エラー発生", state="error")
                 st.error(f"Error: {e}")
         else:
-            st.error("開始日と終了日の両方を選択してください（カレンダーで2回クリック）。")
+            st.error("開始日と終了日の両方を選択してください。")
 
     if st.sidebar.button("キャッシュをクリア"):
         st.cache_data.clear()
-        st.success("キャッシュをクリアしました")
+        st.toast("キャッシュクリア完了")
 
     st.divider()
 
-    # タイトル下の設定状況表示
-    day_str = ",".join(selected_days) if selected_days else "なし"
     if 'data' in st.session_state and not st.session_state.data.empty:
         df = st.session_state.data
+        total_count = len(df)
         
-        # フィルタリング実行
+        # フィルタリング処理用ロジック
         mask = pd.Series(True, index=df.index)
         
         # 1. 日付範囲
         if isinstance(date_range, tuple) and len(date_range) == 2:
             start_d, end_d = date_range
+            # dtカラム(date型)で比較
             mask &= (df['dt'] >= start_d) & (df['dt'] <= end_d)
             
-        # 2. 曜日・時間
-        mask &= df['day_label'].isin(selected_days)
-        mask &= df['slot_label'].isin(selected_slots)
+        # 2. 曜日
+        if selected_days:
+            mask &= df['day_label'].isin(selected_days)
+            
+        # 3. 時間帯
+        if selected_slots:
+            mask &= df['slot_label'].isin(selected_slots)
         
         filtered_df = df[mask]
+        filtered_count = len(filtered_df)
 
-        st.write(f"**検索結果: {len(filtered_df)} 件** (全 {len(df)} 件中)")
-        # デバッグ用: st.dataframe(filtered_df)
-        
+        # デバッグ・ステータス表示
+        if filtered_count > 0:
+            st.success(f"{filtered_count} 件の空きが見つかりました！（全{total_count}件中）")
+        else:
+            st.warning(f"条件に一致する空きはありませんでした。（全{total_count}件取得しましたが、フィルタで0件になりました）")
+            # 親切機能: どういうデータが取れていたかチラ見せ（デバッグ用）
+            with st.expander("フィルタ前の生データを確認する"):
+                st.dataframe(df[['日付', '曜日', '施設名', '時間', '状況', 'day_label', 'slot_label']])
+
+        # 結果表示
         try:
             filtered_df = filtered_df.sort_values(by=["dt", "時間"])
         except: pass
 
-        if filtered_df.empty:
-            st.info("条件に一致する空き状況はありません。")
-        else:
-            for idx, row in filtered_df.iterrows():
-                render_schedule_card(row)
+        for idx, row in filtered_df.iterrows():
+            render_schedule_card(row)
     
     elif 'data' not in st.session_state:
-        st.info("👈 サイドバーで条件を設定し、「最新情報を取得」ボタンを押してください。")
+        st.info("👈 サイドバー情報を確認し、「最新情報を取得」ボタンを押してください。")
 
 if __name__ == "__main__":
     main()
