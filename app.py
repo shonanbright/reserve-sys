@@ -291,8 +291,23 @@ def render_schedule_card(row):
 def main():
     st.title("🏐 湘南Bright 施設予約状況")
     
-    # ユーザー要件: サイドバー設定
-    st.sidebar.header("設定・条件")
+    # サイドバー設定
+    st.sidebar.header("🔍 検索条件の設定")
+    
+    # 1. 期間設定
+    today = datetime.datetime.now().date()
+    default_end = today + datetime.timedelta(days=14)
+    min_date = today
+    max_date = today + datetime.timedelta(days=60)
+    
+    date_range = st.sidebar.date_input(
+        "検索期間を選択",
+        value=(today, default_end),
+        min_value=min_date,
+        max_value=max_date
+    )
+    
+    # 2. 曜日・時間設定
     selected_days = st.sidebar.multiselect(
         "対象の曜日", 
         ["月", "火", "水", "木", "金", "土", "日", "祝"], 
@@ -303,45 +318,56 @@ def main():
         ["午前", "午後", "夜間"], 
         default=["午後", "夜間"]
     )
+    
+    st.sidebar.markdown("---")
 
     if st.sidebar.button("最新情報を取得", type="primary"):
-        st.info("藤沢市予約システムを確認中...")
-        st.session_state.data = pd.DataFrame()
-        status_text = st.status("データ取得中... (数分かかります)", expanded=True)
-        try:
-            raw_data = get_cached_availability("バレーボール")
-            if not raw_data.empty:
-                st.session_state.data = raw_data
-                status_text.update(label="取得完了！", state="complete", expanded=False)
-            else:
-                status_text.update(label="データなし", state="error")
-                st.warning("空き状況は見つかりませんでした。")
-        except Exception as e:
-            status_text.update(label="エラー", state="error")
-            st.error(f"Error: {e}")
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            st.info(f"{date_range[0]} から {date_range[1]} の範囲で確認中...")
+            
+            st.session_state.data = pd.DataFrame()
+            status_text = st.status("データ取得中... (数分かかります)", expanded=True)
+            try:
+                raw_data = get_cached_availability("バレーボール")
+                if not raw_data.empty:
+                    st.session_state.data = raw_data
+                    status_text.update(label="取得完了！", state="complete", expanded=False)
+                else:
+                    status_text.update(label="データなし", state="error")
+                    st.warning("空き状況は見つかりませんでした。")
+            except Exception as e:
+                status_text.update(label="エラー", state="error")
+                st.error(f"Error: {e}")
+        else:
+            st.error("開始日と終了日の両方を選択してください（カレンダーで2回クリック）。")
 
     if st.sidebar.button("キャッシュをクリア"):
         st.cache_data.clear()
-        st.toast("キャッシュクリア完了")
+        st.success("キャッシュをクリアしました")
 
     st.divider()
 
     # タイトル下の設定状況表示
     day_str = ",".join(selected_days) if selected_days else "なし"
-    slot_str = ",".join(selected_slots) if selected_slots else "なし"
-    st.caption(f"曜日: {day_str} | 時間: {slot_str} で絞り込み中")
-
     if 'data' in st.session_state and not st.session_state.data.empty:
         df = st.session_state.data
         
         # フィルタリング実行
         mask = pd.Series(True, index=df.index)
+        
+        # 1. 日付範囲
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_d, end_d = date_range
+            mask &= (df['dt'] >= start_d) & (df['dt'] <= end_d)
+            
+        # 2. 曜日・時間
         mask &= df['day_label'].isin(selected_days)
         mask &= df['slot_label'].isin(selected_slots)
         
         filtered_df = df[mask]
 
         st.write(f"**検索結果: {len(filtered_df)} 件** (全 {len(df)} 件中)")
+        # デバッグ用: st.dataframe(filtered_df)
         
         try:
             filtered_df = filtered_df.sort_values(by=["dt", "時間"])
@@ -354,7 +380,7 @@ def main():
                 render_schedule_card(row)
     
     elif 'data' not in st.session_state:
-        st.info("👈 サイドバーの「最新情報を取得」ボタンを押してください。")
+        st.info("👈 サイドバーで条件を設定し、「最新情報を取得」ボタンを押してください。")
 
 if __name__ == "__main__":
     main()
