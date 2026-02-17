@@ -133,7 +133,6 @@ def scrape_current_schedule_table(driver, results, facility_name, room_name):
     """
     soup = BeautifulSoup(driver.page_source, "html.parser")
     # Identify tables. Usually the schedule table is the one with symbols.
-    # The calendar table has day numbers (1-31).
     tables = soup.find_all("table")
     
     for tbl in tables:
@@ -141,19 +140,10 @@ def scrape_current_schedule_table(driver, results, facility_name, room_name):
         has_symbols = "○" in txt or "×" in txt or "△" in txt
         has_imgs = tbl.find('img', alt=re.compile(r'[○×△]')) or tbl.find('img', src=re.compile(r'(circle|cross|triangle)'))
         
-        # Skip if it looks like just the monthly calendar (1-31 grid without status)
-        # Monthly calendar usually has many empty cells or just numbers, no "time" headers like 09:00.
-        # Schedule table has time headers.
-        has_time = "9:" in txt or "09:" in txt or "11:" in txt or "13:" in txt
-        
+        # Schedule table usually has status symbols. Monthly calendar usually doesn't (just 'link').
         if not (has_symbols or has_imgs):
             continue
             
-        # Refine: if it has time headers, it's likely the schedule.
-        if not has_time:
-            # Maybe it's a simple status table?
-            pass
-
         rows = tbl.find_all("tr")
         if not rows: continue
         
@@ -188,10 +178,6 @@ def scrape_current_schedule_table(driver, results, facility_name, room_name):
                     elif "△" in alt: status = "△"
                     elif "×" in alt or "cross" in src: status = "×"
                 
-                if status == "×" and not ("×" in stat_text or (img and ("×" in img.get('alt','') or "cross" in img.get('src','')))):
-                    # Sometimes cells are empty means nothing available or closed.
-                    pass
-
                 t_slot = headers[i+1] if (i+1) < len(headers) else ""
                 
                 if status in ["○", "△"]:
@@ -207,101 +193,98 @@ def scrape_current_schedule_table(driver, results, facility_name, room_name):
 
 def process_month_calendar_clicks(driver, results, facility_name):
     """
-    Find the monthly calendar, identify Sunday/Saturday cells, click them,
+    Find the MONTHLY calendar (small numbers), click SUNDAY cells (First Column),
     and scrape the resulting schedule table.
     """
     # 1. Locate the Monthly Calendar Table
-    # It usually contains 1..31. And headers "日", "月"...
-    # We want to click "日" (Sunday) columns => usually 1st column in calendar layout.
-    
-    # Strategy: Find all tables. Check for "日" header.
-    # Then get all cells in that column index.
+    # Strategy: Find table that has "日" header but likely NOT "9:00" etc.
+    # Also usually small.
     
     wait = WebDriverWait(driver, 5)
     
-    # Try to find calendar table
     try:
         tables = driver.find_elements(By.TAG_NAME, "table")
         calendar_table = None
-        saturday_col_idx = -1 # Usually 6 (0-indexed)
-        sunday_col_idx = -1   # Usually 0
         
         for tbl in tables:
-            headers = tbl.find_elements(By.TAG_NAME, "th")
-            header_texts = [h.text.strip() for h in headers]
-            if "日" in header_texts and "土" in header_texts:
+            txt = tbl.text
+            # Monthly calendar has "日" and "土" likely
+            if "日" in txt and "土" in txt:
+                # Exclude if it looks like the schedule table (contains time slots or status symbols)
+                # But wait, initially schedule might be empty?
+                # Usually schedule has "9:00" or similar.
+                if "9:" in txt or "09:" in txt or "11:" in txt:
+                    continue
                 calendar_table = tbl
-                # Find indices
-                for idx, txt in enumerate(header_texts):
-                    if "日" == txt: sunday_col_idx = idx
-                    if "土" == txt: saturday_col_idx = idx
                 break
         
         if not calendar_table:
-            # Fallback: Just click anything that looks like a day cell?
-            # Or use specific class if known.
-            # Let's assume standard calendar.
-            logger.warning("Calendar table not found strictly. Trying broader search.")
-            return
-
-        # 2. Collect Clickable Dates (Sundays & Saturdays)
-        # We need to collect them first because clicking one might refresh the whole page/DOM (though usually AJAX).
-        # Should we re-acquire elements after each click? YES.
+            logger.warning("Monthly calendar table not found.")
+            # Fallback: Try to find ANY table with 'calendar' in class?
+            # Or just skip
+            pass
         
-        target_indices = [sunday_col_idx]
-        if saturday_col_idx != -1: target_indices.append(saturday_col_idx)
-        
-        # We iteration logic:
-        # Find table -> Find rows -> Get cells at indices -> Click -> Wait -> Scrape -> Re-find table
-        
-        # How many rows? usually 5-6.
-        # We loop by row index.
-        
-        rows = calendar_table.find_elements(By.TAG_NAME, "tr")
-        row_count = len(rows)
-        
-        for r_idx in range(1, row_count): # Skip header row 0
-            # Re-acquire table and row each time
-            try:
-                # Find table again
-                tables = driver.find_elements(By.TAG_NAME, "table")
-                cal_tbl = None
-                for t in tables:
-                    if "日" in t.text and "土" in t.text:
-                        cal_tbl = t
-                        break
-                if not cal_tbl: break
-                
-                row = cal_tbl.find_elements(By.TAG_NAME, "tr")[r_idx]
-                cols = row.find_elements(By.TAG_NAME, "td")
-                
-                for c_idx in target_indices:
-                    if c_idx < len(cols):
-                        cell = cols[c_idx]
-                        txt = cell.text.strip()
-                        # If empty or not a number, skip
-                        if not txt or not txt.isdigit(): continue
+        if calendar_table:
+            # 2. Get Sunday Cells (First Column)
+            # Find all clickable elements in the 1st column of each row
+            rows = calendar_table.find_elements(By.TAG_NAME, "tr")
+            
+            # Identify Sunday Column Index? usually 0.
+            # Check headers again on this specific table
+            headers = calendar_table.find_elements(By.TAG_NAME, "th")
+            sunday_idx = 0
+            for i, h in enumerate(headers):
+                if "日" in h.text: 
+                    sunday_idx = i
+                    break
+            
+            # We must re-find the table/rows inside the loop to avoid stale elements
+            # So let's store the number of rows or iteration logic
+            row_count = len(rows)
+            
+            for r_idx in range(1, row_count): # Skip header
+                try:
+                    # Re-acquire
+                    tables = driver.find_elements(By.TAG_NAME, "table")
+                    cal_tbl = None
+                    for tbl in tables:
+                        txt = tbl.text
+                        if "日" in txt and "土" in txt and not ("9:" in txt or "09:" in txt):
+                            cal_tbl = tbl
+                            break
+                    if not cal_tbl: break
+                    
+                    row = cal_tbl.find_elements(By.TAG_NAME, "tr")[r_idx]
+                    cols = row.find_elements(By.TAG_NAME, "td")
+                    
+                    if len(cols) > sunday_idx:
+                        cell = cols[sunday_idx]
+                        
+                        # Check if clickable (has link or is button?)
+                        # Or just contains a number
+                        if not re.search(r'\d+', cell.text): continue
+                        
+                        logger.info(f"Clicking Sunday date: {cell.text}")
                         
                         # Click
-                        # Use JS to be safe
                         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", cell)
                         time.sleep(0.2)
                         
-                        # Some sites imply the link is inside the cell
                         try:
+                            # Try clicking link if exists
                             link = cell.find_element(By.TAG_NAME, "a")
                             driver.execute_script("arguments[0].click();", link)
                         except:
                             driver.execute_script("arguments[0].click();", cell)
+                            
+                        # WAIT & SCRAPE
+                        time.sleep(1.5) # Wait for table update
                         
-                        time.sleep(1.5) # Wait for schedule table update
-                        
-                        # Scrape
                         scrape_current_schedule_table(driver, results, facility_name, "体育室")
                         
-            except Exception as e:
-                logger.warning(f"Error clicking date row {r_idx}: {e}")
-                continue
+                except Exception as e:
+                    logger.warning(f"Error processing calendar row {r_idx}: {e}")
+                    continue
 
     except Exception as e:
         logger.error(f"Calendar interaction error: {e}")
@@ -444,7 +427,7 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                      if not is_click_success: continue
 
                      # ---------------------------------------------------------
-                     # 5. DATE-CLICK LOOP (REPLACES PAGINATION)
+                     # 5. SUNDAY CLICK LOOP
                      # ---------------------------------------------------------
                      if _status_callback: _status_callback(f"  📅 カレンダー確認中: {fac}")
                      time.sleep(3) 
@@ -458,16 +441,11 @@ def fetch_availability_deep_scan(start_date=None, end_date=None, selected_facili
                              driver.execute_script(f"var i=document.querySelector('input[type=date]'); if(i){{i.value='{fd}'; i.dispatchEvent(new Event('change'));}}")
                              time.sleep(1)
                          except: pass
-
-                     # Wait for Table
-                     try:
-                         WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "table")))
-                     except: pass
                      
                      # First scrape (Default view)
                      scrape_current_schedule_table(driver, results, fac, "体育室")
                      
-                     # Use the new Date-Click Logic
+                     # Check other weeks
                      process_month_calendar_clicks(driver, results, fac)
                      
                      # ---------------------------------------------------------
