@@ -77,223 +77,198 @@ def safe_click_js(driver, element):
     except:
         return False
 
-def fetch_availability(keyword="バレーボール", start_date=None, _status_callback=None, _progress_bar=None):
+def attempt_scrape_with_retry(keyword, start_date, _status_callback, _progress_bar):
+    for attempt in range(MAX_RETRIES):
+        try:
+            if _status_callback: 
+                msg = f"データ取得を試みています... (回数: {attempt + 1}/{MAX_RETRIES})"
+                _status_callback(msg)
+            
+            df = fetch_availability_core(keyword, start_date, _status_callback, _progress_bar)
+            if not df.empty:
+                return df
+            
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(3) # Retry interval
+        except Exception as e:
+            logger.error(f"Attempt {attempt+1} failed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(3)
+    return pd.DataFrame()
+
+def fetch_availability_core(keyword="バレーボール", start_date=None, _status_callback=None, _progress_bar=None):
     driver = setup_driver()
     wait = WebDriverWait(driver, 30) 
     results = []
 
-    if _status_callback: _status_callback("予約サイトへアクセス中...")
-
     try:
-        # 1. Access
+        # 1. Access & Frame Handling
         driver.get(TARGET_URL)
-        time.sleep(3) # Initial load wait
+        time.sleep(5) # しっかり待つ
 
-        # 2. Date Input (If available)
+        # フレームがある場合はスイッチ (藤沢市はiframeを使っている箇所がある可能性がある)
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+        if frames:
+            driver.switch_to.frame(0) # とりあえず最初のフレームへ
+            logger.info("Switched to iframe")
+
+        # 2. Force Date Input
         if start_date:
-            formatted_date = start_date.strftime("%Y-%m-%d")
-            if _status_callback: _status_callback(f"開始日を {formatted_date} に設定中...")
-            try:
-                # 日付入力フィールドを探す (汎用的なセレクタ)
-                date_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='date'], input[name*='date'], input.datepicker")
-                for inp in date_inputs:
-                    try:
-                        if inp.is_displayed() and inp.is_enabled():
-                            # JSで値を設定してしまうのが確実
-                            driver.execute_script(f"arguments[0].value = '{formatted_date}';", inp)
-                            # イベント発火も試みる
-                            inp.send_keys(Keys.TAB) 
-                            logger.info(f"Date set to {formatted_date}")
-                            break
-                    except: pass
-            except Exception as e:
-                logger.warning(f"Date input setting failed: {e}")
-
-        # 3. Keyword Search
-        if _status_callback: _status_callback(f"「{keyword}」を検索・設定中...")
-        try:
-            # サイト構造に合わせて柔軟に検索ボックスを探す
-            search_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索'], input[name*='keyword']")))
-            search_input.clear()
-            search_input.send_keys(keyword)
-            search_input.send_keys(Keys.ENTER)
+            formatted_date = start_date.strftime("%Y-%m-%d") # HTML5 input standard
+            if _status_callback: _status_callback(f"検索開始日を {formatted_date} に設定...")
             
-            # 検索ボタンがあればクリック
-            try:
-                search_btns = driver.find_elements(By.CSS_SELECTOR, "button.search-btn, input[type='submit'], i.fa-search")
-                for btn in search_btns:
-                    if btn.is_displayed():
-                        btn.click()
-                        break
-            except: pass
-            
-            # 検索結果のロード待機
-            time.sleep(5)
-            wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        except Exception as e:
-            logger.error(f"Search failed: {e}")
-            if _status_callback: _status_callback("検索ボックスが見つかりませんでした。")
-            return pd.DataFrame()
+            # 複数のフォーマットやセレクタで試行
+            inputs_to_try = driver.find_elements(By.CSS_SELECTOR, "input[type='date'], input.datepicker, input[name*='date'], input[id*='date']")
+            for inp in inputs_to_try:
+                try:
+                    if inp.is_displayed():
+                        driver.execute_script(f"arguments[0].value = '{formatted_date}';", inp)
+                        inp.send_keys(Keys.TAB)
+                except: pass
 
-        # 4. Expand Facilities
-        if _status_callback: _status_callback("施設・空き状況を展開中...")
+        # 3. Keyword Search / Partial Link Text
+        if _status_callback: _status_callback(f"「{keyword}」を選択/検索中...")
         
-        # 展開ボタン系をすべて押してみる
+        # まずはリンクテキストでのクリックを試みる (メニュー選択式の場合)
         try:
-            expand_buttons = driver.find_elements(By.CSS_SELECTOR, "button.expand-icon, i.fa-caret-right, span.icon-caret-right, .accordion-toggle")
-            for btn in expand_buttons:
-                safe_click_js(driver, btn)
-                time.sleep(0.5)
+            link = driver.find_element(By.PARTIAL_LINK_TEXT, keyword)
+            safe_click_js(driver, link)
+            time.sleep(3)
+        except:
+            # リンクがない場合は検索ボックスに入力
+            try:
+                search_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索'], input[name*='keyword']")))
+                search_input.clear()
+                search_input.send_keys(keyword)
+                search_input.send_keys(Keys.ENTER)
+                time.sleep(5)
+            except:
+                logger.warning("Keyword search failed")
+
+        # 4. Expand & Scan Facilities (Endo, Akibadai, etc.)
+        if _status_callback: _status_callback("施設データをスキャン中...")
+        
+        # 全体待機
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+        # 施設名を含む可能性のある要素を探す
+        # 検索結果がリスト形式の場合
+        
+        # テーブル行を走査
+        # 藤沢市のシステムがテーブル形式で結果を出すと仮定して全行スキャン
+        try:
+            rows = driver.find_elements(By.TAG_NAME, "tr")
+            for row in rows:
+                text = row.text
+                if keyword in text or "体育館" in text or "センター" in text:
+                    # リンクがあればクリックして詳細へ行くか、その行からデータを取る
+                    links = row.find_elements(By.TAG_NAME, "a")
+                    for link in links:
+                        # カレンダーへ飛ぶリンクなら収集対象
+                        href = link.get_attribute("href")
+                        if href and ("calendar" in href or "reserve" in href):
+                            # ここではURL収集リストに追加するだけにするか、再帰的に処理するか
+                            pass 
         except: pass
 
-        # 5. Extract Room/Calendar Links
-        # カレンダーページへのリンク、またはその場のテーブルを探す
-        room_links_elements = driver.find_elements(By.CSS_SELECTOR, "a.room-link, td.room-name a, .facility-link")
-        
-        # フォールバック: 一般的なリンクから「空き」「カレンダー」っぽいものを探す
-        if not room_links_elements:
-             room_links_elements = [
-                 elem for elem in driver.find_elements(By.TAG_NAME, "a") 
-                 if "空き" in elem.text or "予約" in elem.text or "calendar" in (elem.get_attribute("href") or "")
-             ]
-
+        # カレンダーページへのリンク収集 (より広範囲に)
+        room_links_elements = driver.find_elements(By.CSS_SELECTOR, "a")
         room_urls = []
         for elem in room_links_elements:
             try:
-                url = elem.get_attribute("href")
-                if url and "javascript" not in url and "#" not in url:
-                    room_urls.append((elem.text, url))
+                txt = elem.text
+                href = elem.get_attribute("href")
+                if href and "javascript" not in href and "#" not in href:
+                    # 特定のキーワードが含まれるか、またはカレンダーっぽいURL
+                    if "空き" in txt or "予約" in txt or "詳細" in txt or "facility" in href or "calendar" in href:
+                         room_urls.append((txt, href))
             except: pass
         
-        # URLが見つからない -> 現在のページが検索結果(カレンダー一覧)かもしれない
-        if not room_urls:
-            room_urls = [("検索結果", driver.current_url)]
-
-        # Duplicate removal
+        # 重複削除
         room_urls = list(set(room_urls))
+        # まったくなければ現在ページを対象
+        if not room_urls:
+            room_urls = [("Current Page", driver.current_url)]
 
-        # 6. Iterate Rooms
+        # 5. Loop Rooms
         total_rooms = len(room_urls)
         
-        for r_idx, (room_name, url) in enumerate(room_urls):
-            current_progress_base = r_idx / max(total_rooms, 1)
-            
-            # URLが現在のページと違うなら遷移
-            if url != driver.current_url and url != "current":
-                if _status_callback: _status_callback(f"移動中: {room_name}")
+        for r_idx, (r_name, url) in enumerate(room_urls):
+             # Progress
+            if _progress_bar:
+                _progress_bar.progress(min((r_idx / max(total_rooms, 1)), 0.9))
+
+            if url != driver.current_url and url != "Current Page":
                 driver.get(url)
                 time.sleep(3)
-                wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-
+            
+            # 施設名取得
             try:
-                facility_name_elem = driver.find_elements(By.CSS_SELECTOR, "h1, h2, .facility-title, .title")
-                facility_name = facility_name_elem[0].text if facility_name_elem else "施設"
-            except:
-                facility_name = "施設"
+                facility_name = "不明な施設"
+                titles = driver.find_elements(By.CSS_SELECTOR, "h1, h2, h3, .title, .facility-name")
+                for t in titles:
+                    if t.text: 
+                        facility_name = t.text
+                        break
+            except: pass
 
             if _status_callback: _status_callback(f"解析中: {facility_name}")
 
-            # 7. Iterate Weeks
-            # 指定された開始日から十分な期間
-            loop_weeks = 8 # デフォルト
-            
-            for week in range(loop_weeks):
-                # Update progress
-                if _progress_bar:
-                   step_prog = (week / loop_weeks) / max(total_rooms, 1)
-                   _progress_bar.progress(min(current_progress_base + step_prog, 0.95))
-
-                try:
-                    # カレンダーテーブルを探す
-                    # 待機
-                    try:
-                        wait.until(EC.presence_of_element_located((By.TAG_NAME, "table")))
-                    except:
-                        # テーブルがないなら次へ（カレンダーがないページかも）
-                        break
-
-                    soup = BeautifulSoup(driver.page_source, "html.parser")
-                    tables = soup.find_all("table")
-                    
-                    target_table = None
-                    for tbl in tables:
-                        txt = tbl.get_text()
-                        if "空" in txt or "○" in txt or "×" in txt or "/" in txt:
-                            target_table = tbl
-                            break
-                    
-                    if target_table:
-                        rows = target_table.find_all("tr")
-                        if rows:
-                            # ヘッダー解析 (時間帯など)
-                            try:
-                                header_row = rows[0]
-                                headers = [th.get_text(strip=True) for th in header_row.find_all(["th", "td"])]
-                            except: headers = []
-                            
-                            for tr in rows[1:]:
-                                cols = tr.find_all(["th", "td"])
-                                if not cols: continue
-                                
-                                # 日付カラム (通常1列目)
-                                date_col_text = cols[0].get_text(strip=True)
-                                
-                                # 各時間枠
-                                for i, td in enumerate(cols[1:]):
-                                    status = td.get_text(strip=True)
-                                    # ステータス正規化
-                                    if "○" in status: norm_status = "○"
-                                    elif "△" in status: norm_status = "△"
-                                    elif "×" in status: norm_status = "×"
-                                    elif "休" in status: continue
-                                    else: continue # 空白やー
-                                    
-                                    time_slot = headers[i+1] if (i+1) < len(headers) else "時間不明"
-                                    
-                                    if norm_status in ["○", "△"]:
-                                        results.append({
-                                            "日付": date_col_text,
-                                            "曜日": "", # 後処理で計算
-                                            "施設名": facility_name,
-                                            "室場名": room_name,
-                                            "時間": time_slot,
-                                            "状況": norm_status
-                                        })
-
-                    # 次の週へ
-                    # "Next" ボタンを探してクリック
-                    next_found = False
-                    if week < loop_weeks - 1:
-                        next_selectors = [
-                            "button.next", "a.next-week", "i.fa-chevron-right", 
-                            "a[title='翌週']", "a[title='次月']",
-                            "button.fc-next-button", ".fc-next-button"
-                        ]
-                        for sel in next_selectors:
-                            btns = driver.find_elements(By.CSS_SELECTOR, sel)
-                            for btn in btns:
-                                if btn.is_displayed():
-                                    try:
-                                        safe_click_js(driver, btn)
-                                        time.sleep(2) # 読み込み待機
-                                        next_found = True
-                                        break
-                                    except: pass
-                            if next_found: break
+            # 6. Parse Table (Full Scan)
+            try:
+                soup = BeautifulSoup(driver.page_source, "html.parser")
+                tables = soup.find_all("table")
+                
+                for tbl in tables:
+                    # そのテーブルがカレンダーか判定
+                    if not ("日" in tbl.get_text() and ("○" in tbl.get_text() or "空" in tbl.get_text() or "×" in tbl.get_text())):
+                        continue
                         
-                        if not next_found:
-                            break # 次へボタンがないならループ終了
-
-                except Exception as e:
-                    logger.debug(f"Week loop error: {e}")
-                    break
-        
-        if _progress_bar: _progress_bar.progress(1.0)
-        if _status_callback: _status_callback("全データの取得が完了しました！")
+                    rows = tbl.find_all("tr")
+                    if not rows: continue
+                    
+                    # ヘッダー解析
+                    headers = []
+                    header_row = rows[0]
+                    for th in header_row.find_all(["th", "td"]):
+                        headers.append(th.get_text(strip=True))
+                        
+                    # データ行解析
+                    for tr in rows[1:]:
+                        cols = tr.find_all(["th", "td"])
+                        if not cols: continue
+                        
+                        # 1列目は日付と仮定
+                        date_val = cols[0].get_text(strip=True)
+                        
+                        # 2列目以降は時間枠
+                        for i, col in enumerate(cols[1:]):
+                            val = col.get_text(strip=True)
+                            
+                            # ステータス判定
+                            status = "×"
+                            if "○" in val or "空" in val: status = "○"
+                            elif "△" in val: status = "△"
+                            elif "休" in val or "-" in val: continue
+                            else: continue # 対象外
+                            
+                            # 時間帯名
+                            time_slot = headers[i+1] if (i+1) < len(headers) else f"枠{i+1}"
+                            
+                            if status in ["○", "△"]:
+                                results.append({
+                                    "日付": date_val,
+                                    "曜日": "", 
+                                    "施設名": facility_name,
+                                    "室場名": r_name if r_name != "Current Page" else "",
+                                    "時間": time_slot,
+                                    "状況": status
+                                })
+            except Exception as e:
+                logger.error(f"Table parse error: {e}")
 
     except Exception as e:
-        logger.error(f"Global Scraper Error: {e}")
-        if _status_callback: _status_callback(f"エラー: {e}")
+        logger.error(f"Global Error: {e}")
     finally:
         driver.quit()
 
@@ -313,31 +288,23 @@ def enrich_data(df):
     def parse_date(date_str):
         if not isinstance(date_str, str): return None
         try:
-            # 数字以外を除去してパースを試みる
-            # "3/15(土)" -> 3, 15
-            # "2024年3月15日" 対応
-            # まず (曜日) をカット
-            clean_str = date_str.split('(')[0].replace('年', '/').replace('月', '/').replace('日', '')
-            parts = clean_str.split('/')
+            # "3/1" -> 3, 1
+            # "2026/03/01" -> 2026, 3, 1
+            clean = date_str.split('(')[0].strip()
+            # 区切り文字統一
+            clean = clean.replace('年', '/').replace('月', '/').replace('日', '').replace('-', '/')
+            parts = clean.split('/')
             
-            month = 1
-            day = 1
-            year = CURRENT_YEAR
-            
-            if len(parts) >= 2:
-                month = int(parts[-2])
-                day = int(parts[-1])
-            elif len(parts) == 1:
-                # 日付だけ？稀
-                day = int(parts[0])
-
-            dt = datetime.date(year, month, day)
-            
-            # 過去日付なら来年とみなす (例: 今日12月でデータが1月)
-            if dt < TODAY - datetime.timedelta(days=30): # 余裕を持たせる
-                dt = datetime.date(year + 1, month, day)
-            
-            return dt
+            if len(parts) == 3:
+                y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+                return datetime.date(y, m, d)
+            elif len(parts) == 2:
+                m, d = int(parts[0]), int(parts[1])
+                dt = datetime.date(CURRENT_YEAR, m, d)
+                if dt < TODAY - datetime.timedelta(days=60): # 過去すぎたら来年
+                    dt = datetime.date(CURRENT_YEAR + 1, m, d)
+                return dt
+            return None
         except:
             return None
 
@@ -355,9 +322,10 @@ def enrich_data(df):
     
     # 時間帯区分
     def get_slot_label(time_str):
-        if "09" in time_str or "11" in time_str or "午前" in time_str: return "午前"
-        if "13" in time_str or "15" in time_str or "午後" in time_str: return "午後"
-        if "17" in time_str or "19" in time_str or "夜間" in time_str: return "夜間"
+        t = time_str
+        if "09" in t or "11" in t or "午前" in t: return "午前"
+        if "13" in t or "15" in t or "午後" in t: return "午後"
+        if "17" in t or "19" in t or "夜間" in t: return "夜間"
         return "その他"
 
     df['slot_label'] = df['時間'].apply(get_slot_label)
@@ -366,7 +334,8 @@ def enrich_data(df):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_availability(keyword, start_date=None, _status_callback=None, _progress_bar=None):
-    df = fetch_availability(keyword, start_date, _status_callback, _progress_bar)
+    # Retry Logic Wrapper
+    df = attempt_scrape_with_retry(keyword, start_date, _status_callback, _progress_bar)
     return enrich_data(df)
 
 def render_schedule_card(row):
@@ -433,7 +402,6 @@ def main():
 
     if st.sidebar.button("最新情報を取得", type="primary"):
         start_d = None
-        end_d = None
         
         if isinstance(date_range, tuple) and len(date_range) == 2:
             start_d, end_d = date_range
