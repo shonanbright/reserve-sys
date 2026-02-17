@@ -50,6 +50,9 @@ st.markdown("""
 TARGET_URL = "https://fujisawacity.service-now.com/facilities_reservation"
 MAX_RETRIES = 3
 
+# 対象施設リスト（検索フィルタ用）
+FACILITIES = ["藤沢", "鵠沼", "村岡", "明治", "御所見", "遠藤", "長後", "辻堂", "善行", "湘南大庭", "六会", "湘南台", "片瀬"]
+
 # --- Scraper Logic (Deep Scan with Navigation) ---
 def setup_driver():
     options = Options()
@@ -76,14 +79,14 @@ def safe_click_js(driver, element):
     except:
         return False
 
-def attempt_scrape_with_retry(keyword, start_date, end_date, _status_callback, _progress_bar):
+def attempt_scrape_with_retry(keyword, start_date, end_date, selected_facilities, _status_callback, _progress_bar):
     for attempt in range(MAX_RETRIES):
         try:
             if _status_callback: 
                 msg = f"データ取得 試行 {attempt + 1}回目..."
                 _status_callback(msg)
             
-            df = fetch_availability_deep_scan(keyword, start_date, end_date, _status_callback, _progress_bar)
+            df = fetch_availability_deep_scan(keyword, start_date, end_date, selected_facilities, _status_callback, _progress_bar)
             if not df.empty:
                 return df
             
@@ -95,7 +98,7 @@ def attempt_scrape_with_retry(keyword, start_date, end_date, _status_callback, _
                 time.sleep(3)
     return pd.DataFrame()
 
-def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, end_date=None, _status_callback=None, _progress_bar=None):
+def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, end_date=None, selected_facilities=None, _status_callback=None, _progress_bar=None):
     driver = setup_driver()
     wait = WebDriverWait(driver, 30) 
     results = []
@@ -169,8 +172,8 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
 
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-        # 4. Traverse Room List (Collect URLs)
-        if _status_callback: _status_callback("📋 室場リストを取得中...")
+        # 4. Traverse Room List (Collect URLs & Filter by Facility)
+        if _status_callback: _status_callback("📋 室場リストを取得・フィルタリング中...")
         
         target_urls = []
         try:
@@ -181,10 +184,22 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                     href = link.get_attribute("href")
                     if href and ("calendar" in href or "reserve" in href or "detail" in href):
                         row_raw_text = row.text.replace("\n", " ")
-                        target_urls.append({
-                            "url": href,
-                            "raw_text": row_raw_text
-                        })
+                        
+                        # Facility Filtering Logic
+                        is_target = False
+                        if not selected_facilities: # No selection => All
+                            is_target = True
+                        else:
+                            for f in selected_facilities:
+                                if f in row_raw_text:
+                                    is_target = True
+                                    break
+                        
+                        if is_target:
+                            target_urls.append({
+                                "url": href,
+                                "raw_text": row_raw_text
+                            })
         except: pass
         
         # Deduplicate
@@ -194,13 +209,8 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
         target_list = list(unique_targets.values())
 
         if not target_list:
-             all_links = driver.find_elements(By.TAG_NAME, "a")
-             for a in all_links:
-                 try:
-                     href = a.get_attribute("href")
-                     if href and ("calendar" in href):
-                         target_list.append({"url": href, "raw_text": a.text})
-                 except: pass
+             # If exact logic failed, dump all links if no filter, or warn
+             pass
 
         # 5. Detail Loop with "Next Month" Support
         total_targets = len(target_list)
@@ -215,7 +225,8 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
             # Identify Facility
             facility_name = "不明"
             room_name = "不明"
-            known_facilities = ["秋葉台", "秩父宮", "石名坂", "鵠沼", "北部", "太陽", "八部", "遠藤"]
+            # Add extended facility list for better naming
+            known_facilities = FACILITIES + ["秋葉台", "秩父宮", "石名坂", "鵠沼", "北部", "太陽", "八部", "遠藤"]
             for kf in known_facilities:
                 if kf in raw_text:
                     facility_name = kf
@@ -347,9 +358,8 @@ def enrich_data(df):
     df['曜日'] = df.apply(get_day, axis=1)
     return df
 
-# REMOVED @st.cache_data DECORATOR HERE TO FIX STREAMLIT ERROR
-def get_data(keyword, start_date, end_date, _status, _progress):
-    df = attempt_scrape_with_retry(keyword, start_date, end_date, _status, _progress)
+def get_data(keyword, start_date, end_date, selected_facilities, _status, _progress):
+    df = attempt_scrape_with_retry(keyword, start_date, end_date, selected_facilities, _status, _progress)
     return enrich_data(df)
 
 def render_schedule_card(row):
@@ -399,6 +409,13 @@ def main():
     )
     st.sidebar.info("種目: バレーボール")
     
+    # Facility Selection (Default: Chogo)
+    fac_labels = [f + "市民センター" for f in FACILITIES] # Display friendly labels? Or just strings
+    # The user said "Chogo Civic Center" is default.
+    # We will use simple strings for multiselect and match partial
+    default_fac = ["長後"]
+    selected_target_facilities = st.sidebar.multiselect("対象施設 (市民センター)", FACILITIES, default=default_fac)
+
     day_options = ["月", "火", "水", "木", "金", "土", "日", "祝"]
     selected_days = st.sidebar.multiselect("曜日指定", day_options, default=["土", "日", "祝"])
 
@@ -414,25 +431,24 @@ def main():
             start_d, end_d = d_input
         else:
             st.error("期間を正しく選択してください")
-            return # Don't proceed if invalid date
+            return 
 
         status_box = st.status("🚀 処理中...", expanded=True)
         p_bar = status_box.progress(0)
         
         try:
-            # Replaced caching with direct call and session state persistence
-            df = get_data("バレーボール", start_d, end_d, status_box.write, p_bar)
+            # Pass selected_target_facilities to scraper to visit only relevant links
+            df = get_data("バレーボール", start_d, end_d, selected_target_facilities, status_box.write, p_bar)
             st.session_state.data = df
             status_box.update(label="完了", state="complete", expanded=False)
             
         except Exception as e:
             st.error(f"エラー: {e}")
 
-    # Display Logic - Runs on every re-run if data exists
+    # Display Logic
     if not st.session_state.data.empty:
         df = st.session_state.data.copy()
         
-        # Determine date range for filtering (use last selected or full range)
         start_d, end_d = d_input if (isinstance(d_input, tuple) and len(d_input) == 2) else (TODAY, TODAY + datetime.timedelta(days=14))
         
         mask = pd.Series(True, index=df.index)
