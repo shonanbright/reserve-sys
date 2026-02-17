@@ -128,22 +128,25 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                         time.sleep(1)
                 except: pass
 
-        # 3. Category Search (Indoor Sports -> Volleyball)
-        if _status_callback: _status_callback("🏐 カテゴリ「屋内スポーツ」→「バレーボール」を選んで検索実行...")
+        # 3. New Search Flow: "Facility Group" (施設グループ) -> "Civic Center" (市民センター)
+        if _status_callback: _status_callback("🏢 「施設グループ」タブから検索中...")
         search_done = False
         
         try:
-            # Step A: Click "Indoor Sports" (屋内スポーツ)
-            indoor_labels = driver.find_elements(By.XPATH, "//label[contains(text(), '屋内スポーツ')] | //span[contains(text(), '屋内スポーツ')] | //a[contains(text(), '屋内スポーツ')]")
-            for lbl in indoor_labels:
-                if lbl.is_displayed():
-                    safe_click_js(driver, lbl)
+            # Step A: Click "Search from Facility Group" Tab
+            # Tab text might be "施設グループから探す"
+            # Try multiple selectors
+            group_tabs = driver.find_elements(By.XPATH, "//a[contains(text(), '施設グループ')] | //li[contains(text(), '施設グループ')] | //span[contains(text(), '施設グループ')]")
+            for tab in group_tabs:
+                if tab.is_displayed():
+                    safe_click_js(driver, tab)
                     time.sleep(1)
                     break
             
-            # Step B: Click "Volleyball" (バレーボール)
-            volley_labels = driver.find_elements(By.XPATH, "//label[contains(text(), 'バレーボール')] | //span[contains(text(), 'バレーボール')] | //a[contains(text(), 'バレーボール')]")
-            for lbl in volley_labels:
+            # Step B: Click "Civic Center" Checkbox/Label
+            # Should be "市民センター"
+            civic_labels = driver.find_elements(By.XPATH, "//label[contains(text(), '市民センター')] | //span[contains(text(), '市民センター')]")
+            for lbl in civic_labels:
                 if lbl.is_displayed():
                     safe_click_js(driver, lbl)
                     time.sleep(1)
@@ -156,16 +159,16 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                 btn_clicked = False
                 for btn in search_btns:
                     if btn.is_displayed():
-                        # Force JS Click
                         driver.execute_script("arguments[0].click();", btn)
                         btn_clicked = True
                         time.sleep(2) 
                         break
         except Exception as e:
-            logger.warning(f"Category search error: {e}")
+            logger.warning(f"Facility Group search error: {e}")
 
-        # Fallback to Text Search if Category failed
+        # Fallback (Old Search) if Facility Group failed
         if not search_done:
+            # Simple keyword search fallback just in case
             try:
                 search_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search'], input[placeholder*='検索'], input[name*='keyword']")))
                 search_input.clear()
@@ -182,34 +185,32 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
              if _status_callback: _status_callback("⚠️ 室場リストが見つかりませんでした。リトライします。")
              raise Exception("Room list not found")
 
-        # 4. Traverse Room List (Collect URLs & Strict Facility Filter)
+        # 4. Traverse Room List (Collect URLs & Filter by Facility + "Gymnasium")
         target_urls = []
         try:
             rows = driver.find_elements(By.CSS_SELECTOR, "tr")
             for row in rows:
                 row_raw_text = row.text.replace("\n", " ")
                 
-                # Check Facility Name *Before* finding link
-                is_target = False
-                if not selected_facilities: 
-                    is_target = True
+                # Check Facility Name AND "Gymnasium" (体育室)
+                if selected_facilities:
+                    has_facility = any(f in row_raw_text for f in selected_facilities)
                 else:
-                    for f in selected_facilities:
-                        if f in row_raw_text:
-                            is_target = True
-                            break
+                    has_facility = True # Allow if empty selection (but logic requires fac)
                 
-                if is_target:
+                has_gym = "体育室" in row_raw_text
+
+                if has_facility and has_gym:
                     links = row.find_elements(By.TAG_NAME, "a")
                     for link in links:
                         href = link.get_attribute("href")
-                        # Click "Check Availability/Reserve" (空き状況確認・予約)
-                        # We use URL heuristics primarily as button text varies
                         if href and ("calendar" in href or "reserve" in href or "detail" in href):
-                            target_urls.append({
-                                "url": href,
-                                "raw_text": row_raw_text
-                            })
+                            # Ensure "Check Availability" flow
+                            if "確認" in link.text or "予約" in link.text or "calendar" in href:
+                                target_urls.append({
+                                    "url": href,
+                                    "raw_text": row_raw_text
+                                })
         except: pass
         
         # Deduplicate
@@ -219,11 +220,11 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
         target_list = list(unique_targets.values())
 
         if not target_list:
-            raise Exception("条件に一致する施設が見つかりませんでした (0件)")
+            raise Exception("条件に一致する施設（体育室）が見つかりませんでした (0件)")
 
-        # 5. Detail Loop with "Next Month" Support
+        # 5. Detail Loop with Navigation
         total_targets = len(target_list)
-        if _status_callback: _status_callback(f"🔍 {total_targets} 件の室場が見つかりました。詳細カレンダーを巡回します...")
+        if _status_callback: _status_callback(f"🔍 {total_targets} 件の室場（体育室）が見つかりました。詳細カレンダーを巡回します...")
 
         for idx, target in enumerate(target_list):
             url = target['url']
@@ -248,12 +249,11 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
             driver.get(url)
             time.sleep(1)
             
-            # --- Calendar Navigation Loop ---
+            # --- Calendar Loop ---
             for _ in range(5): 
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 calendar_tables = soup.find_all("table")
                 
-                parsed_something = False
                 for tbl in calendar_tables:
                     txt_content = tbl.get_text()
                     if not ("空" in txt_content or "○" in txt_content or "×" in txt_content):
@@ -290,7 +290,6 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                                 "時間": t_slot,
                                 "状況": status
                             })
-                    parsed_something = True
 
                 if _ >= 3: 
                     break
@@ -311,7 +310,6 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
 
     except Exception as e:
         logger.error(f"Scrape Error: {e}")
-        # Re-raise to trigger top-level retry
         raise e
     finally:
         driver.quit()
