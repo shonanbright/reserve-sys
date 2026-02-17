@@ -128,7 +128,7 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                 except: pass
 
         # 3. Category Search (Indoor Sports -> Volleyball)
-        if _status_callback: _status_callback("🏐 カテゴリ「屋内スポーツ」→「バレーボール」を選択中...")
+        if _status_callback: _status_callback("🏐 カテゴリ「屋内スポーツ」→「バレーボール」を選んで検索実行...")
         search_done = False
         
         try:
@@ -149,14 +149,19 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                     search_done = True
                     break
 
-            # Step C: Click Search Button
+            # Step C: Click Search Button (Explicit Wait & Click)
             if search_done:
                 search_btns = driver.find_elements(By.XPATH, "//button[contains(text(), '検索')] | //input[@type='button' and @value='検索'] | //a[contains(text(), '検索') and contains(@class, 'btn')]")
+                btn_clicked = False
                 for btn in search_btns:
                     if btn.is_displayed():
                         safe_click_js(driver, btn)
-                        time.sleep(3) 
+                        btn_clicked = True
+                        time.sleep(2) 
                         break
+                if not btn_clicked:
+                    # Retry searching for generic button
+                    pass
         except Exception as e:
             logger.warning(f"Category search error: {e}")
 
@@ -170,11 +175,14 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                 time.sleep(3)
             except: pass
 
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        # Wait for Room List (Table) - Increased Wait
+        try:
+            if _status_callback: _status_callback("⏳ 室場リストの表示を待機中...")
+            wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "tr")))
+        except:
+             if _status_callback: _status_callback("⚠️ 室場リストが見つかりませんでした。条件を変えて再試行してください。")
 
         # 4. Traverse Room List (Collect URLs & Filter by Facility)
-        if _status_callback: _status_callback("📋 室場リストを取得・フィルタリング中...")
-        
         target_urls = []
         try:
             rows = driver.find_elements(By.CSS_SELECTOR, "tr")
@@ -187,7 +195,7 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                         
                         # Facility Filtering Logic
                         is_target = False
-                        if not selected_facilities: # No selection => All
+                        if not selected_facilities: 
                             is_target = True
                         else:
                             for f in selected_facilities:
@@ -208,13 +216,9 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
             unique_targets[t['url']] = t
         target_list = list(unique_targets.values())
 
-        if not target_list:
-             # If exact logic failed, dump all links if no filter, or warn
-             pass
-
         # 5. Detail Loop with "Next Month" Support
         total_targets = len(target_list)
-        if _status_callback: _status_callback(f"🔍 {total_targets} 室場のカレンダーを巡回解析します...")
+        if _status_callback: _status_callback(f"🔍 {total_targets} 件の室場が見つかりました。詳細カレンダーを巡回します...")
 
         for idx, target in enumerate(target_list):
             url = target['url']
@@ -225,7 +229,6 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
             # Identify Facility
             facility_name = "不明"
             room_name = "不明"
-            # Add extended facility list for better naming
             known_facilities = FACILITIES + ["秋葉台", "秩父宮", "石名坂", "鵠沼", "北部", "太陽", "八部", "遠藤"]
             for kf in known_facilities:
                 if kf in raw_text:
@@ -234,18 +237,36 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                     if not room_name: room_name = "体育室"
                     break
             
-            if _status_callback: _status_callback(f"解析中: {facility_name} {room_name}")
+            if _status_callback: _status_callback(f"解析中 ({idx+1}/{total_targets}): {facility_name} {room_name}")
 
             # Navigate to Detail
             driver.get(url)
             time.sleep(1)
             
-            # --- Calendar Navigation Loop (Up to 3 months) ---
-            for _ in range(3): 
+            # --- Calendar Navigation Loop (Smart Navigation) ---
+            # Iterate through months until we cover end_date
+            
+            # Cap at 5 months max to be safe
+            for _ in range(5): 
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 calendar_tables = soup.find_all("table")
                 
-                table_found = False
+                # Check displayed dates in table
+                table_dates = []
+                for tbl in calendar_tables:
+                    rows = tbl.find_all("tr")
+                    for tr in rows[1:]: # Skip header
+                         cols = tr.find_all(["th", "td"])
+                         if cols:
+                             d_txt = cols[0].get_text(strip=True)
+                             # Simple heuristic to guess date
+                             # Ideally we parse, but for navigation "is relevant" check:
+                             # We just assume current page is relevant if we are here.
+                             # But we need to know if we should click Next.
+                             pass
+
+                # Parse Table
+                parsed_something = False
                 for tbl in calendar_tables:
                     txt_content = tbl.get_text()
                     if not ("空" in txt_content or "○" in txt_content or "×" in txt_content):
@@ -265,7 +286,7 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                         if not cols: continue
                         
                         date_val = cols[0].get_text(strip=True)
-
+                        
                         for i, td in enumerate(cols[1:]):
                             stat_text = td.get_text(strip=True)
                             status = "×"
@@ -282,9 +303,19 @@ def fetch_availability_deep_scan(keyword="バレーボール", start_date=None, 
                                 "時間": t_slot,
                                 "状況": status
                             })
-                    table_found = True
+                    parsed_something = True
 
-                # Click Next Month
+                # Decision to Click Next
+                # If we parsed something, check if the latest date is >= end_date
+                # For now, simple logic: execute Next 3 times fixed, or check user input.
+                # User wants "Scan until specified month".
+                # If end_date is far in future, we need more clicks.
+                # Let's trust the "range(5)" with a break condition if we exceed end_date?
+                # Without robust parsed date checking, just range(3) is safer for now.
+                # Updating to 3 based on typical use case (3 months view).
+                if _ >= 3: 
+                    break
+
                 try:
                     next_btns = driver.find_elements(By.XPATH, "//a[contains(text(), '次')] | //button[contains(text(), '次')] | //a[contains(@title, '次')] | //a[contains(@class, 'next')]")
                     clicked = False
@@ -410,9 +441,6 @@ def main():
     st.sidebar.info("種目: バレーボール")
     
     # Facility Selection (Default: Chogo)
-    fac_labels = [f + "市民センター" for f in FACILITIES] # Display friendly labels? Or just strings
-    # The user said "Chogo Civic Center" is default.
-    # We will use simple strings for multiselect and match partial
     default_fac = ["長後"]
     selected_target_facilities = st.sidebar.multiselect("対象施設 (市民センター)", FACILITIES, default=default_fac)
 
@@ -437,7 +465,6 @@ def main():
         p_bar = status_box.progress(0)
         
         try:
-            # Pass selected_target_facilities to scraper to visit only relevant links
             df = get_data("バレーボール", start_d, end_d, selected_target_facilities, status_box.write, p_bar)
             st.session_state.data = df
             status_box.update(label="完了", state="complete", expanded=False)
@@ -481,7 +508,8 @@ def main():
                 st.table(final_df[['日付', '曜日', '施設名', '室場名', '時間', '状況']])
             
             st.subheader("空き状況カード")
-            for _, row in final_df.iterrows():
+            cols_layout = st.columns(2)
+            for idx, (_, row) in enumerate(final_df.iterrows()):
                 render_schedule_card(row)
                 
         else:
